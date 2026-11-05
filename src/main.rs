@@ -17,7 +17,31 @@ fn main() -> eframe::Result<()> {
     // Headless self-check: exercises the exact same library calls as the GUI.
     //   probe-rs-studio.exe --selftest <firmware.hex> [chip] [--write]
     // Without --write it only enumerates / connects / reads back / verifies.
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Unified headless entry: `--load <file>` mirrors the single GUI button.
+    // Normalise the switch by file type *before* dispatch, so pack and FLM
+    // keep sharing all of their existing conversion/import logic.
+    if let Some(pos) = args.iter().position(|a| a == "--load") {
+        let Some(file) = args.get(pos + 1).cloned() else {
+            eprintln!(
+                "用法: probe-rs-studio.exe --load <file.pack|file.pack.zip|file.FLM> [--out <yaml>]"
+            );
+            std::process::exit(2);
+        };
+        args[pos] = match pack::classify_source(std::path::Path::new(&file)) {
+            Some(pack::ChipSource::Flm) => "--flm",
+            Some(pack::ChipSource::Pack) => "--pack",
+            None => {
+                eprintln!(
+                    "不是芯片支持文件: {file}（需要 .pack / .pack.zip / .FLM，或已解压的 pack 目录）"
+                );
+                std::process::exit(2);
+            }
+        }
+        .to_owned();
+    }
+
     if let Some(pos) = args.iter().position(|a| a == "--selftest") {
         let Some(firmware) = args.get(pos + 1) else {
             eprintln!("用法: probe-rs-studio.exe --selftest <固件路径> [芯片型号] [--write]");
@@ -60,10 +84,10 @@ fn main() -> eframe::Result<()> {
         }
     }
 
-    // Headless CMSIS-Pack conversion: probe-rs-studio.exe --pack <file> [--out <yaml>]
+    // Headless CMSIS-Pack conversion: probe-rs-studio.exe --load|--pack <file> [--out <yaml>]
     if let Some(pos) = args.iter().position(|a| a == "--pack") {
         let Some(file) = args.get(pos + 1) else {
-            eprintln!("用法: probe-rs-studio.exe --pack <file.pack|file.pack.zip> [--out <yaml>]");
+            eprintln!("用法: probe-rs-studio.exe --load|--pack <file.pack|file.pack.zip> [--out <yaml>]");
             std::process::exit(2);
         };
         let path = std::path::PathBuf::from(file);

@@ -23,6 +23,64 @@ use base64::Engine as _;
 use quick_xml::{events::Event as XmlEvent, reader::Reader};
 
 // ---------------------------------------------------------------------------
+// Unified chip-support source
+// ---------------------------------------------------------------------------
+
+/// A CMSIS-Pack is only a `.pdsc` description wrapped around one or more
+/// `.FLM` flash algorithms, so both sources share a single UI button /
+/// CLI switch. This is the one place that decides how a picked path is handled:
+/// the GUI button, drag & drop and `--load` all call `classify_source()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChipSource {
+    /// `.pack`, `.pack.zip`, `.zip` or an already-extracted pack directory.
+    Pack,
+    /// A bare `.FLM`: chip name / core / RAM must be supplied by the user.
+    Flm,
+}
+
+/// `None` means "not a chip-support source" (e.g. a firmware file), so a
+/// dropped path can fall through to the firmware loader.
+///
+/// Because every file picker has an "all files" filter, a picked file may have
+/// no (or an unusual) extension. Those are identified by magic bytes: a ZIP
+/// header means a pack, an ELF header means a flash algorithm. Known firmware
+/// extensions are never sniffed, otherwise an ELF firmware would be mistaken
+/// for an algorithm.
+pub fn classify_source(path: &Path) -> Option<ChipSource> {
+    if path.is_dir() {
+        return Some(ChipSource::Pack);
+    }
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if name.ends_with(".flm") {
+        return Some(ChipSource::Flm);
+    }
+    // `.pack.zip` is already covered by `.zip`.
+    if name.ends_with(".pack") || name.ends_with(".zip") {
+        return Some(ChipSource::Pack);
+    }
+    if matches!(
+        name.rsplit('.').next().unwrap_or(""),
+        "elf" | "axf" | "out" | "hex" | "ihex" | "bin" | "yaml" | "yml"
+    ) {
+        return None;
+    }
+
+    let mut magic = [0u8; 4];
+    if fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+    {
+        if magic[0] == b'P' && magic[1] == b'K' {
+            return Some(ChipSource::Pack);
+        }
+        if &magic == b"\x7fELF" {
+            return Some(ChipSource::Flm);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // ZIP (central directory; stored + deflate; optional one-level nesting)
 // ---------------------------------------------------------------------------
 
@@ -1431,6 +1489,67 @@ mod tests {
                     .map(|v| v.trim().to_owned())
             })
             .collect()
+    }
+
+    /// The single GUI button / `--load` switch must route every supported
+    /// source to the right importer, and leave firmware files alone.
+    #[test]
+    fn chip_sources_are_classified_by_file_type() {
+        for name in [
+            "vendor.pack",
+            "Vendor.PACK",
+            "vendor.pack.zip",
+            "Vendor.PACK.ZIP",
+            "vendor.zip",
+        ] {
+            assert_eq!(
+                classify_source(Path::new(name)),
+                Some(ChipSource::Pack),
+                "{name}"
+            );
+        }
+        for name in ["Algo.FLM", "Algo.flm"] {
+            assert_eq!(
+                classify_source(Path::new(name)),
+                Some(ChipSource::Flm),
+                "{name}"
+            );
+        }
+        for name in ["fw.hex", "fw.bin", "fw.elf", "chip.yaml", "no_extension"] {
+            assert_eq!(classify_source(Path::new(name)), None, "{name}");
+        }
+        // An already-extracted pack (dropped on the window or chosen in the
+        // settings page) is a pack regardless of its name.
+        assert_eq!(
+            classify_source(&std::env::current_dir().unwrap()),
+            Some(ChipSource::Pack)
+        );
+    }
+
+    /// Files chosen through the "all files" filter need not carry a known
+    /// extension; ZIP / ELF headers still identify them correctly.
+    #[test]
+    fn unknown_extensions_are_recognised_by_magic() {
+        let dir = std::env::temp_dir().join(format!(
+            "probe-rs-studio-sniff-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("vendor_backup");
+        let elf = dir.join("flash_algo_blob");
+        let txt = dir.join("readme");
+        fs::write(&zip, b"PK\x03\x04rest-of-the-zip").unwrap();
+        fs::write(&elf, b"\x7fELF\x01\x01\x01\x00").unwrap();
+        fs::write(&txt, b"not a chip support file").unwrap();
+
+        assert_eq!(classify_source(&zip), Some(ChipSource::Pack));
+        assert_eq!(classify_source(&elf), Some(ChipSource::Flm));
+        assert_eq!(classify_source(&txt), None);
+        // An ELF firmware must not be rerouted to the FLM importer.
+        assert_eq!(classify_source(Path::new("fw.elf")), None);
+        assert_eq!(classify_source(Path::new("fw.hex")), None);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

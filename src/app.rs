@@ -47,6 +47,18 @@ impl Nav {
     }
 }
 
+/// The one and only "add chip support" button, shared by the chip-library
+/// sidebar and the settings page. A pack is simply a container around FLM
+/// algorithms, so users should not have to guess which button fits their file.
+const CHIP_SOURCE_BUTTON: &str = "加载芯片支持…";
+
+/// Every file picker offers an "all files" option: call this *first* in the
+/// chain for open dialogs (so no vendor file is hidden by its extension) and
+/// *last* for save dialogs (so the default extension stays the document one).
+fn with_all_files(dialog: rfd::FileDialog) -> rfd::FileDialog {
+    dialog.add_filter("全部文件 (*.*)", &["*"])
+}
+
 fn default_true() -> bool {
     true
 }
@@ -761,18 +773,16 @@ impl App {
     fn sidebar_chips(&mut self, ui: &mut Ui, p: Palette) {
         ui.label(RichText::new("芯片库").size(13.0).strong().color(p.text));
         ui.add_space(8.0);
-        if Self::primary_button(ui, p, "加载 CMSIS-Pack…", !self.busy).clicked() {
-            self.pick_pack(false);
+        if Self::primary_button(ui, p, CHIP_SOURCE_BUTTON, !self.busy).clicked() {
+            self.pick_chip_source();
         }
         ui.add_space(6.0);
-        if Self::ghost_button(ui, p, "加载 .FLM 算法…", !self.busy).clicked() {
-            self.pick_flm();
-        }
         ui.label(
             RichText::new(
-                "内置库没有的芯片：导入厂商 .pack / .pack.zip；\n\
-                 只有单个 .FLM 时也可用它生成新型号（需填内核与 RAM）。\n\
-                 两种方式都会自动转换为芯片描述并永久保存。",
+                "内置库没有的芯片：选厂商 .pack / .pack.zip，\n\
+                 或只给一个 .FLM 算法，自动识别并永久保存。\n\
+                 pack 里的算法会全部导入，无需逐一挑选；\n\
+                 已解压的 pack 目录可直接拖入窗口。",
             )
             .size(9.0)
             .color(p.text3),
@@ -919,7 +929,7 @@ impl App {
         ui.label(RichText::new(desc).size(10.0).color(p.text2));
         ui.horizontal(|ui| {
             if ui.button("选择…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
+                if let Some(path) = with_all_files(rfd::FileDialog::new())
                     .add_filter("芯片描述", &["yaml", "yml"])
                     .pick_file()
                 {
@@ -931,21 +941,18 @@ impl App {
             }
         });
         ui.add_space(16.0);
-        ui.label(RichText::new("扩展芯片包 (.pack)").size(11.0).color(p.text3));
+        ui.label(RichText::new("扩展芯片支持").size(11.0).color(p.text3));
         ui.label(
-            RichText::new("转换结果写入 targets/，启动时自动加载；\n也支持已解压的 pack 目录。")
+            RichText::new("一个入口同时支持 .pack / .pack.zip / .FLM；\n转换结果写入 targets/，启动时自动加载。")
                 .size(9.0)
                 .color(p.text3),
         );
         ui.horizontal(|ui| {
-            if ui.button("加载 .pack…").clicked() {
-                self.pick_pack(false);
+            if ui.button(CHIP_SOURCE_BUTTON).clicked() {
+                self.pick_chip_source();
             }
-            if ui.button("目录…").clicked() {
-                self.pick_pack(true);
-            }
-            if ui.button("加载 .FLM…").clicked() {
-                self.pick_flm();
+            if ui.button("已解压目录…").clicked() {
+                self.pick_chip_source_folder();
             }
         });
         ui.add_space(16.0);
@@ -957,42 +964,70 @@ impl App {
         let _ = p;
     }
 
-    /// Ask for a CMSIS-Pack and hand it to the background converter.
-    fn pick_pack(&mut self, folder: bool) {
-        let picked = if folder {
-            rfd::FileDialog::new().pick_folder()
-        } else {
-            rfd::FileDialog::new()
-                .add_filter("CMSIS-Pack", &["pack", "zip"])
-                .pick_file()
-        };
-        if let Some(path) = picked {
-            self.start_job(Job::LoadPack(path), "导入 CMSIS-Pack");
-        }
-    }
-
-    /// Choose a standalone `.FLM` and pre-fill its import form from the
-    /// FlashDevice embedded in the ELF.
-    fn pick_flm(&mut self) {
+    /// The single "add chip support" file picker. One filter covers every
+    /// supported source; the specialised filters are only there to narrow the
+    /// listing if the user wants to.
+    fn pick_chip_source(&mut self) {
         if self.busy {
             self.push_log(Level::Warn, "上一个任务尚未结束，请稍候");
             return;
         }
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = with_all_files(rfd::FileDialog::new())
+            .add_filter("芯片支持 (.pack / .pack.zip / .FLM)", &["pack", "zip", "FLM", "flm"])
+            .add_filter("CMSIS-Pack", &["pack", "zip"])
             .add_filter("Flash 算法", &["FLM", "flm"])
             .pick_file()
         else {
             return;
         };
-        match pack::inspect_flm(&path) {
-            Ok(info) => {
+        self.load_chip_source(path);
+    }
+
+    /// Already-extracted pack directory: file pickers cannot select folders,
+    /// so this stays a small secondary entry (or just drop the folder on the
+    /// window). It routes through exactly the same code as the main button.
+    fn pick_chip_source_folder(&mut self) {
+        if self.busy {
+            self.push_log(Level::Warn, "上一个任务尚未结束，请稍候");
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.load_chip_source(path);
+        }
+    }
+
+    /// One dispatcher for everything that can add a chip family: the main
+    /// button, the folder picker and drag & drop all end up here.
+    fn load_chip_source(&mut self, path: PathBuf) {
+        if self.busy {
+            self.push_log(Level::Warn, "上一个任务尚未结束，请稍候");
+            return;
+        }
+        match pack::classify_source(&path) {
+            Some(pack::ChipSource::Pack) => {
                 self.push_log(
                     Level::Info,
-                    format!("已选择 .FLM: {} · {}", path.display(), info.summary()),
+                    format!("已选择芯片支持包: {}（自动解析其中的 FLM）", path.display()),
                 );
-                self.flm_form = Some(FlmForm::from_file(path, &info));
+                self.start_job(Job::LoadPack(path), "导入芯片支持");
             }
-            Err(err) => self.push_log(Level::Error, format!("读取 .FLM 失败: {err:#}")),
+            Some(pack::ChipSource::Flm) => match pack::inspect_flm(&path) {
+                Ok(info) => {
+                    self.push_log(
+                        Level::Info,
+                        format!("已选择 .FLM: {} · {}", path.display(), info.summary()),
+                    );
+                    self.flm_form = Some(FlmForm::from_file(path, &info));
+                }
+                Err(err) => self.push_log(Level::Error, format!("读取 .FLM 失败: {err:#}")),
+            },
+            None => self.push_log(
+                Level::Warn,
+                format!(
+                    "不是芯片支持文件: {}（需要 .pack / .pack.zip / .FLM）",
+                    path.display()
+                ),
+            ),
         }
     }
 
@@ -1025,7 +1060,7 @@ impl App {
         let mut cancel = false;
         let mut submit: Option<FlmForm> = None;
         if let Some(form) = self.flm_form.as_mut() {
-            egui::Window::new("加载 .FLM 算法")
+            egui::Window::new("加载芯片支持 · 单个 .FLM 算法")
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(true)
@@ -1155,10 +1190,11 @@ impl App {
     }
 
     fn export_logs(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("日志", &["txt", "log"])
-            .set_file_name("probe-rs-studio.log")
-            .save_file()
+        let Some(path) = with_all_files(
+            rfd::FileDialog::new().add_filter("日志", &["txt", "log"]),
+        )
+        .set_file_name("probe-rs-studio.log")
+        .save_file()
         else {
             return;
         };
@@ -1321,7 +1357,7 @@ impl App {
                             ui.add_space(10.0);
                             ui.horizontal(|ui| {
                                 if Self::ghost_button(ui, p, "浏览…", true).clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
+                                    if let Some(path) = with_all_files(rfd::FileDialog::new())
                                         .add_filter("固件", &["hex", "ihex", "elf", "axf", "out", "bin"])
                                         .pick_file()
                                     {
@@ -1436,10 +1472,11 @@ impl App {
                                         .color(p.text3),
                                 );
                                 if ui.button("更改…").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("二进制", &["bin"])
-                                        .set_file_name("backup_before.bin")
-                                        .save_file()
+                                    if let Some(path) = with_all_files(
+                                        rfd::FileDialog::new().add_filter("二进制", &["bin"]),
+                                    )
+                                    .set_file_name("backup_before.bin")
+                                    .save_file()
                                     {
                                         self.cfg.backup_path = path;
                                     }
@@ -1607,7 +1644,13 @@ impl eframe::App for App {
                 .collect()
         });
         for path in dropped {
-            self.set_firmware(path);
+            // One drop target for both: chip-support sources are routed to the
+            // shared importer, everything else is treated as firmware.
+            if pack::classify_source(&path).is_some() {
+                self.load_chip_source(path);
+            } else {
+                self.set_firmware(path);
+            }
         }
 
         self.draw_top(root, p);
@@ -1737,5 +1780,43 @@ mod tests {
         form.ap = "0".to_owned();
         form.load_address = "0x20000400".to_owned();
         assert_eq!(form.to_spec().unwrap().load_address, Some(0x2000_0400));
+    }
+
+    /// Regression guard: pack and FLM used to be two separate buttons. A pack
+    /// is only a container around FLM algorithms, so both pages must keep
+    /// exactly one shared "load chip support" entry.
+    #[test]
+    fn chip_library_and_settings_share_one_load_button() {
+        let source = include_str!("app.rs");
+        let call = concat!("self.pick_chip_", "source()");
+        assert_eq!(source.matches(call).count(), 2);
+        // concat! keeps the legacy labels out of this test's own source text,
+        // otherwise include_str! would see them and the guard would be useless.
+        for old in [
+            concat!("加载 CMSIS-", "Pack…"),
+            concat!("加载 .FLM ", "算法…"),
+            concat!("加载 .", "pack…"),
+            concat!("加载 .FLM", "…"),
+            concat!("fn pick_", "pack("),
+            concat!("fn pick_", "flm("),
+        ] {
+            assert!(!source.contains(old), "old split entry point still present: {old}");
+        }
+        assert_eq!(CHIP_SOURCE_BUTTON, "加载芯片支持…");
+        assert!(source.contains("const CHIP_SOURCE_BUTTON"));
+    }
+
+    /// Every file picker must keep the "all files" filter, otherwise a vendor
+    /// file with an unusual extension is invisible in the open dialog.
+    #[test]
+    fn every_file_picker_offers_all_files() {
+        let source = include_str!("app.rs");
+        let helper = concat!("with_all_", "files(");
+        // One helper definition + chip support, chip description, firmware,
+        // log export and backup path = 6 occurrences.
+        assert_eq!(source.matches(helper).count(), 6);
+        let open_first = concat!("with_all_", "files(rfd::FileDialog::new())");
+        assert_eq!(source.matches(open_first).count(), 3);
+        assert!(source.contains(concat!("全部文件 (*.", "*)")));
     }
 }
