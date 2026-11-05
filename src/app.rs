@@ -32,6 +32,20 @@ enum Nav {
     Settings,
 }
 
+impl Nav {
+    /// Shown in the in-app top bar. The OS window title already carries the
+    /// product name, so the inner bar shows context instead of repeating it.
+    fn title(self) -> &'static str {
+        match self {
+            Nav::Workbench => "工作台",
+            Nav::Devices => "调试探针",
+            Nav::Chips => "芯片库",
+            Nav::Logs => "运行日志",
+            Nav::Settings => "设置",
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -413,8 +427,14 @@ impl App {
                         .logo
                         .paint(ui.painter(), logo_rect, Color32::WHITE);
                     ui.add_space(6.0);
-                    ui.label(RichText::new("ProbeRS Studio").size(15.0).strong().color(p.text));
-                    ui.label(RichText::new("固件烧录工作台").size(12.0).color(p.text3));
+                    // The OS title bar owns the product name; keep this bar
+                    // contextual so the same words are not printed twice.
+                    ui.label(
+                        RichText::new(self.nav.title())
+                            .size(15.0)
+                            .strong()
+                            .color(p.text),
+                    );
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new("BETA")
@@ -1304,5 +1324,36 @@ fn level_color(l: Level, p: Palette) -> Color32 {
         Level::Warn => p.warn,
         Level::Error => p.error,
         Level::Debug => p.text3,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression guard: the OS title bar and the in-app top bar used to both
+    /// print "ProbeRS Studio · 固件烧录工作台", producing a duplicate heading.
+    #[test]
+    fn top_bar_never_repeats_the_window_title() {
+        let pages = [
+            Nav::Workbench,
+            Nav::Devices,
+            Nav::Chips,
+            Nav::Logs,
+            Nav::Settings,
+        ];
+        let mut unique = std::collections::HashSet::new();
+        for nav in pages {
+            let title = nav.title();
+            assert!(!title.is_empty(), "every page needs a top-bar label");
+            assert!(
+                !crate::WINDOW_TITLE.contains(title) && !title.contains(crate::WINDOW_TITLE),
+                "top bar label {title:?} duplicates window title {:?}",
+                crate::WINDOW_TITLE
+            );
+            assert!(!title.contains("ProbeRS"), "brand belongs to the OS title bar");
+            assert!(unique.insert(title), "duplicate page label {title:?}");
+        }
+        assert_eq!(unique.len(), pages.len());
     }
 }

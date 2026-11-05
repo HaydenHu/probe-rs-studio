@@ -6,6 +6,10 @@ mod firmware;
 mod icons;
 mod theme;
 
+/// OS window title (taskbar / Alt-Tab). The in-app top bar deliberately does
+/// not repeat this string — see `Nav::title`.
+pub const WINDOW_TITLE: &str = "ProbeRS Studio";
+
 fn main() -> eframe::Result<()> {
     // Headless self-check: exercises the exact same library calls as the GUI.
     //   probe-rs-studio.exe --selftest <firmware.hex> [chip] [--write]
@@ -50,7 +54,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("ProbeRS Studio · 固件烧录工作台")
+        .with_title(WINDOW_TITLE)
         .with_inner_size([1280.0, 820.0])
         .with_min_inner_size([1040.0, 680.0])
         .with_drag_and_drop(true);
@@ -62,7 +66,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "ProbeRS Studio",
+        WINDOW_TITLE,
         options,
         Box::new(|cc| {
             let app = app::App::new(cc);
