@@ -667,6 +667,15 @@ impl App {
     fn sidebar_chips(&mut self, ui: &mut Ui, p: Palette) {
         ui.label(RichText::new("芯片库").size(13.0).strong().color(p.text));
         ui.add_space(8.0);
+        if Self::primary_button(ui, p, "加载 CMSIS-Pack…", !self.busy).clicked() {
+            self.pick_pack(false);
+        }
+        ui.label(
+            RichText::new("内置库没有的芯片：导入厂商 .pack / .pack.zip，\n自动转换为芯片描述并永久保存。")
+                .size(9.0)
+                .color(p.text3),
+        );
+        ui.add_space(10.0);
         ui.add_sized(
             [ui.available_width(), 30.0],
             egui::TextEdit::singleline(&mut self.chip_search).hint_text("搜索型号，如 PY32F003"),
@@ -685,6 +694,12 @@ impl App {
             RichText::new(format!("匹配 {} / {} 个型号", filtered.len(), self.chips.len()))
                 .size(10.0)
                 .color(p.text3),
+        );
+        let extra = self.chips.iter().filter(|c| c.external).count();
+        ui.label(
+            RichText::new(format!("其中扩展包型号 {extra} 个"))
+                .size(10.0)
+                .color(p.accent),
         );
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
@@ -814,12 +829,41 @@ impl App {
             }
         });
         ui.add_space(16.0);
+        ui.label(RichText::new("扩展芯片包 (.pack)").size(11.0).color(p.text3));
+        ui.label(
+            RichText::new("转换结果写入 targets/，启动时自动加载；\n也支持已解压的 pack 目录。")
+                .size(9.0)
+                .color(p.text3),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("加载 .pack…").clicked() {
+                self.pick_pack(false);
+            }
+            if ui.button("目录…").clicked() {
+                self.pick_pack(true);
+            }
+        });
+        ui.add_space(16.0);
         ui.label(
             RichText::new("所有设置会自动保存到程序同目录的 probe-rs-studio.json")
                 .size(10.0)
                 .color(p.text3),
         );
         let _ = p;
+    }
+
+    /// Ask for a CMSIS-Pack and hand it to the background converter.
+    fn pick_pack(&mut self, folder: bool) {
+        let picked = if folder {
+            rfd::FileDialog::new().pick_folder()
+        } else {
+            rfd::FileDialog::new()
+                .add_filter("CMSIS-Pack", &["pack", "zip"])
+                .pick_file()
+        };
+        if let Some(path) = picked {
+            self.start_job(Job::LoadPack(path), "导入 CMSIS-Pack");
+        }
     }
 
     fn export_logs(&mut self) {

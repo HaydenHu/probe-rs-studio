@@ -18,7 +18,7 @@
 ## 功能
 
 - 探针枚举、按设备身份选择、连接测试；USB 插入/拔出自动检测（1.5 秒轮询 + 去抖），烧录期间自动暂停轮询
-- 内置约 4700 个芯片型号，另附 Holychip HC32F4XX 系列（由 CMSIS-Pack 转换）；可搜索、查看内存布局与 Flash 算法，支持外部 `.yaml` 芯片描述
+- 内置约 4700 个芯片型号，另附 Holychip HC32F4XX 系列；**内置库没有的芯片可直接导入厂商 `.pack` / `.pack.zip`**（纯 Rust 解析，自动转换并永久保存），支持外部 `.yaml` 芯片描述
 - HEX / ELF / BIN 固件解析（地址区间、记录数、SHA256），支持拖拽载入
 - 一键烧录、库内 verify、独立读回 SHA256 比对、烧录前读回备份、复位运行、整片擦除（二次确认）
 - 深浅双主题、SVG 矢量导航图标（运行时用 epaint 直接绘制，无位图纹理）、可折叠日志台、进度与状态栏
@@ -62,35 +62,53 @@ probe-rs = { path = "../probe-rs/probe-rs", default-features = false, features =
 
 `.cargo/config.example.toml` 里还提供了共享 `target-dir` 与国内 crates.io 镜像的可选配置。
 
-## 扩展芯片包
+## 扩展芯片包 / 导入厂商 .pack
 
-内置芯片描述之外，程序还会加载由 CMSIS-Pack 转换出的 probe-rs target YAML：
+内置库里没有的芯片，**直接在界面里导入厂商 CMSIS-Pack 即可**，不需要重新编译、
+不需要 Python、也不需要 probe-rs 源码里的 `target-gen`：
+
+- 「芯片库」页 → **加载 CMSIS-Pack…**；或「设置」页 → **加载 .pack… / 目录…**
+- 支持 `.pack`、`.pack.zip`（外层再套一层 ZIP）、以及已解压的 pack 目录
+- 程序用纯 Rust 解析 `.pdsc`（器件、内存、算法引用）与 `.FLM`（ELF32 Flash 算法），
+  生成 probe-rs target YAML；先用 `Registry::add_target_family_from_yaml()` 校验通过，
+  才写入 exe 同目录 `targets/<包名>.yaml`（不会留下坏文件）
+- 写入后立即刷新芯片库，日志逐条列出新增型号；**重启后自动加载**，
+  条目在芯片库中标注「· 扩展包」，之后可像内置芯片一样搜索、查看详情、连接、烧录、校验
 
 | 来源 | 位置 | 说明 |
 | --- | --- | --- |
 | 随程序编译 | `targets/HC32F4XX.yaml` | 通过 `include_str!` 嵌入 exe，单个可执行文件即可运行 |
-| 用户扩展 | exe 同目录 `targets/*.yaml`（或运行目录 `targets/*.yaml`） | 启动时自动扫描，放进去即生效，无需重新编译 |
+| 导入的 pack | exe 同目录 `targets/*.yaml`（或运行目录 `targets/*.yaml`） | 由界面/CLI 自动生成，启动时自动扫描，放进去即生效 |
 | 临时指定 | 设置页「外部芯片描述 (.yaml)」 | 单文件，优先级最高，可覆盖同名 family |
 
-当前附带 `Holychip.HC32F4XX.1.0.7.pack` 生成的 3 个型号：`HC32F401BRCX`（256 KiB Flash）、
-`HC32F401BREX`（512 KiB）、`HC32F401BRGX`（1024 KiB），Cortex-M4 / 192 KiB RAM，
-每个型号带各自容量的 Flash 算法。芯片库中这些条目会标注「· 扩展包」。
-
-添加其它系列时，在 probe-rs 源码中用官方工具转换：
+命令行同样可用（无需打开窗口）：
 
 ```bash
-cargo run -p target-gen -- pack <厂商.pack> <输出目录>
+# 无需硬件，打印当前芯片库总数与扩展包加载情况
+probe-rs-studio.exe --chips
+
+# 导入 pack，走与 GUI 按钮完全相同的路径（校验 → 写入 → 刷新芯片库）
+probe-rs-studio.exe --pack <厂商.pack.zip>
+
+# 只转换不安装，把 YAML 写到指定位置
+probe-rs-studio.exe --pack <厂商.pack> --out <out.yaml>
 ```
 
-把生成的 YAML 放进 `targets/` 就会被自动加载；若希望像 HC32F4XX 一样编进 exe，
-把文件加入 `src/backend.rs` 的 `BUNDLED_FAMILIES` 常量即可。
+**支持范围与限制**
 
-> 注意：`target-gen pack` 会把代码相同、仅 `FlashDevice` 参数不同的算法去重。
-> 本 pack 的 3 个 FLM 恰好属于这种情况，官方输出漏掉了 256K 算法，让
-> `HC32F401BRCX` 误用 512K 算法。仓库里的 `HC32F4XX.yaml` 因此改由
-> `tools/flm_to_yaml.py` 生成：它直接解析解包后的 `.FLM`，按同样规则为每个容量
-> 生成独立算法。脚本输出与官方输出在 512K / 1024K 上逐字段一致（指令 blob、
-> 各入口偏移、超时、扇区）。
+- 内核：`Cortex-M0/M0+` → `armv6m`，`M3` → `armv7m`，`M4/M7` → `armv7em`，
+  `M23/M33/M55/M85/Star-MC1` → `armv8m`；其它内核明确报错，不会生成错误描述
+- `.FLM` 需为 32 位小端 ELF，含 `PrgCode` / `PrgData` 段与 `FlashDevice` 符号（Keil 标准格式）
+- 按 `(FLM, 声明的 Flash 区间)` 生成算法实例，**不做代码内容去重**：不同容量但代码相同的
+  FLM 会各自生成独立算法，避免官方 `target-gen` 把 256K 算法误去重的问题
+- 只提取 Flash 算法与内存布局；不导入 SVD、启动文件、外设头文件等非烧录所需内容
+- 同名的 family 会覆盖内置同名描述，日志会显示加载来源
+
+当前附带 `Holychip.HC32F4XX.1.0.7.pack` 的 3 个型号：`HC32F401BRCX`（256 KiB Flash）、
+`HC32F401BREX`（512 KiB）、`HC32F401BRGX`（1024 KiB），Cortex-M4 / 192 KiB RAM。
+`tools/flm_to_yaml.py` 是生成这份 bundled YAML 的离线脚本；界面内的转换器是
+`src/pack.rs`（纯 Rust），单测用 `tests/fixtures/` 里的精简 pack 覆盖 ZIP 嵌套、
+pdsc、ELF32 与 Registry 解析。
 
 ## 自检与诊断
 
@@ -104,7 +122,11 @@ probe-rs-studio.exe --selftest <firmware.hex> PY32F003x8 --write
 # 打印调试探针热插拔事件，N 秒内可插拔 USB 观察
 probe-rs-studio.exe --watch 8
 
-# 单元测试（矢量图标解析、多边形三角化、主题配色、热插拔比较与 diff）
+# 芯片库检查（无需硬件）/ 导入 CMSIS-Pack
+probe-rs-studio.exe --chips
+probe-rs-studio.exe --pack <厂商.pack.zip>
+
+# 单元测试（pack 转换、矢量图标、主题配色、热插拔 diff、Registry 解析）
 cargo test --release --bin probe-rs-studio
 ```
 
@@ -123,14 +145,16 @@ cargo test --release --bin probe-rs-studio
 ## 目录结构
 
 ```
-src/main.rs       入口、窗口配置、--selftest / --watch 分派
-src/app.rs        主题、配置持久化、热插拔事件处理
-src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、设备监视
+src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --pack 分派
+src/app.rs        主题、配置持久化、热插拔事件处理、pack 导入按钮
+src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、设备监视、pack 导入
+src/pack.rs       CMSIS-Pack 转换器：ZIP / pdsc XML / ELF32 FLM / target YAML（纯 Rust）
 src/firmware.rs   HEX / ELF / BIN 解析与 SHA256
 src/theme.rs      深浅两套配色、CJK 字体安装
 src/icons.rs      SVG 子集解析 + epaint 矢量绘制
 assets/icons/     6 个 SVG 图标 + Windows 任务栏图标 RGBA
 targets/          CMSIS-Pack 转换出的扩展芯片描述 YAML
+tests/fixtures/   精简 pack 与 .pack.zip 测试样本
 tools/gen_icons.py  由统一几何定义生成 SVG 与 OS 图标
-tools/flm_to_yaml.py 从解包后的 CMSIS-Pack .FLM 离线生成 target YAML
+tools/flm_to_yaml.py 生成 bundled HC32F4XX.yaml 的离线脚本（历史用途）
 ```

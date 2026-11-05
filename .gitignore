@@ -14,3 +14,8 @@ probe-rs-studio.json
 *.bmp
 *.hex
 *.elf
+
+# Chip descriptions generated when a user imports a CMSIS-Pack. Keep the one
+# family that is compiled into the executable via include_str!.
+/targets/*.yaml
+!/targets/HC32F4XX.yaml

@@ -120,6 +120,8 @@ pub enum Job {
         chip: String,
         cfg: Box<FlashConfig>,
     },
+    /// Import a user-supplied CMSIS-Pack into `targets/`.
+    LoadPack(PathBuf),
     Connect(Box<FlashConfig>),
     ReadBack(Box<FlashConfig>),
     Flash(Box<FlashConfig>),
@@ -254,6 +256,7 @@ fn run(job: Job, tx: &Sender<Event>) -> Result<String> {
         Job::RefreshProbes => refresh_probes(tx),
         Job::LoadChips => load_chips(tx),
         Job::ChipInfo { chip, cfg } => chip_info(&chip, Some(cfg.as_ref()), tx),
+        Job::LoadPack(path) => load_pack(&path, tx),
         Job::Connect(cfg) => {
             let mut session = connect(&cfg, tx)?;
             let summary = describe_session(&mut session)?;
@@ -602,6 +605,92 @@ fn load_chips(tx: &Sender<Event>) -> Result<String> {
     );
     let _ = tx.send(Event::Chips(chips));
     Ok(format!("已加载 {count} 个芯片型号"))
+}
+
+/// Convert a CMSIS-Pack into a probe-rs chip family, validate it, persist it
+/// under `targets/` and refresh the chip library shown in the UI.
+fn load_pack(path: &std::path::Path, tx: &Sender<Event>) -> Result<String> {
+    log(
+        tx,
+        Level::Info,
+        format!("解析 CMSIS-Pack: {}", path.display()),
+    );
+    let converted = crate::pack::convert(path)?;
+
+    // Never leave a broken description behind: probe-rs must accept the YAML
+    // before it is written to the auto-loaded directory.
+    let mut check = Registry::from_builtin_families();
+    check
+        .add_target_family_from_yaml(&converted.yaml)
+        .context("生成的芯片描述无法被 probe-rs 解析")?;
+
+    let dest = crate::pack::install(path, &converted.yaml)?;
+    log(
+        tx,
+        Level::Ok,
+        format!(
+            "已生成 {} 个型号 / {} 个 Flash 算法",
+            converted.variants.len(),
+            converted.algorithms.len()
+        ),
+    );
+    for name in &converted.variants {
+        log(tx, Level::Info, format!("新增芯片: {name}"));
+    }
+    log(
+        tx,
+        Level::Info,
+        format!("芯片描述: {}", dest.display()),
+    );
+    load_chips(tx)?;
+    Ok(format!(
+        "已加载 {} 个型号 → {}",
+        converted.variants.len(),
+        dest.display()
+    ))
+}
+
+/// Headless chip-library check (`--chips`): no hardware needed, prints the
+/// same layered registry the GUI builds.
+pub fn chip_library() -> Result<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let result = load_chips(&tx);
+    drop(tx);
+    while let Ok(event) = rx.try_recv() {
+        if let Event::Log(level, msg) = event {
+            let tag = match level {
+                Level::Info => "INFO",
+                Level::Ok => "OK  ",
+                Level::Warn => "WARN",
+                Level::Error => "ERR ",
+                Level::Debug => "DBG ",
+            };
+            println!("    [{tag}] {msg}");
+        }
+    }
+    result
+}
+
+/// Headless counterpart of the GUI's "load CMSIS-Pack" button: same
+/// conversion, validation, persistence and chip-library refresh, with log
+/// events mirrored to stdout. Used by `--pack <file>` without `--out`.
+pub fn import_pack(path: &std::path::Path) -> Result<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let result = load_pack(path, &tx);
+    drop(tx);
+    while let Ok(event) = rx.try_recv() {
+        if let Event::Log(level, msg) = event {
+            let tag = match level {
+                Level::Info => "INFO",
+                Level::Ok => "OK  ",
+                Level::Warn => "WARN",
+                Level::Error => "ERR ",
+                Level::Debug => "DBG ",
+            };
+            println!("    [{tag}] {msg}");
+        }
+    }
+    result
 }
 
 fn chip_info(chip: &str, cfg: Option<&FlashConfig>, tx: &Sender<Event>) -> Result<String> {
