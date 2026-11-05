@@ -5,8 +5,8 @@ edition = "2021"
 description = "A DSH-style desktop flashing workbench built directly on the probe-rs library"
 
 [dependencies]
-eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts"] }
-egui = "0.32"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.37"
 # Maintained fork: the daplink-hid-fallback branch carries the CMSIS-DAP v1
 # HID packet-size fallback required by DAPLink clones that never answer
 # DAP_Info(PacketSize). See README for the local path-override workflow.

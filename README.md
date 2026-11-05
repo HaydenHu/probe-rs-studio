@@ -1,6 +1,6 @@
 # ProbeRS Studio
 
-纯 Rust 编写的桌面固件烧录工作台，界面仿 DSH 桌面版。直接链接 `probe-rs` 库，不调用外部 CLI、不启动子进程、不依赖 WebView/Electron。
+纯 Rust 编写的桌面固件烧录工作台。直接链接 `probe-rs` 库，不调用外部 CLI、不启动子进程、不依赖 WebView/Electron。
 
 ## 两个仓库
 
@@ -26,8 +26,8 @@
 
 ## 环境要求
 
-- Rust stable（MSRV 由 probe-rs 决定，建议使用最新 stable）
-- 支持 OpenGL 的桌面环境（eframe/glow 后端）
+- Rust **1.95+**（egui / eframe 0.37 的 MSRV 为 1.95）
+- 支持 OpenGL 的桌面环境（egui / eframe 0.37 的 glow 后端，未启用 wgpu）
 - Windows：运行时加载 `C:/Windows/Fonts/Deng.ttf`（或 `msyh.ttc` / `simhei.ttf`）作为中文字体回退；egui 内置字体不含 CJK 字形
 - 构建需能访问 crates.io 与 github.com；如网络受限，参见 `.cargo/config.example.toml`
 
@@ -92,7 +92,7 @@ cargo test --release --bin probe-rs-studio
 
 ```
 src/main.rs       入口、窗口配置、--selftest / --watch 分派
-src/app.rs        DSH 风格界面、主题、配置持久化、热插拔事件处理
+src/app.rs        主题、配置持久化、热插拔事件处理
 src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、设备监视
 src/firmware.rs   HEX / ELF / BIN 解析与 SHA256
 src/theme.rs      深浅两套配色、CJK 字体安装

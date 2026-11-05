@@ -399,11 +399,11 @@ impl App {
         ui.add_enabled(enabled, btn)
     }
 
-    fn draw_top(&mut self, ctx: &egui::Context, p: Palette) {
-        egui::TopBottomPanel::new(egui::panel::TopBottomSide::Top, "top_bar")
-            .exact_height(52.0)
+    fn draw_top(&mut self, root: &mut egui::Ui, p: Palette) {
+        egui::Panel::top("top_bar")
+            .exact_size(52.0)
             .frame(Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(14, 8)))
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 ui.horizontal(|ui| {
                     // Brand mark: logo image on the accent plate.
                     let (rect, _) = ui.allocate_exact_size(Vec2::new(30.0, 30.0), Sense::hover());
@@ -452,9 +452,9 @@ impl App {
             });
     }
 
-    fn draw_rail(&mut self, ctx: &egui::Context, p: Palette) {
-        egui::SidePanel::new(egui::panel::Side::Left, "rail")
-            .exact_width(62.0)
+    fn draw_rail(&mut self, root: &mut egui::Ui, p: Palette) {
+        egui::Panel::left("rail")
+            .exact_size(62.0)
             .resizable(false)
             .frame(
                 Frame::new()
@@ -462,7 +462,7 @@ impl App {
                     .stroke(Stroke::new(1.0, p.rail_border))
                     .inner_margin(egui::Margin::symmetric(8, 12)),
             )
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 ui.vertical_centered(|ui| {
                     let items: [(Nav, IconKind, &str); 5] = [
                         (Nav::Workbench, IconKind::Workbench, "工作台"),
@@ -502,12 +502,12 @@ impl App {
             });
     }
 
-    fn draw_sidebar(&mut self, ctx: &egui::Context, p: Palette) {
-        egui::SidePanel::new(egui::panel::Side::Left, "sidebar")
-            .exact_width(248.0)
+    fn draw_sidebar(&mut self, root: &mut egui::Ui, p: Palette) {
+        egui::Panel::left("sidebar")
+            .exact_size(248.0)
             .resizable(false)
             .frame(Frame::new().fill(p.sidebar).inner_margin(14.0))
-            .show(ctx, |ui| match self.nav {
+            .show(root, |ui| match self.nav {
                 Nav::Workbench => self.sidebar_workbench(ui, p),
                 Nav::Devices => self.sidebar_devices(ui, p),
                 Nav::Chips => self.sidebar_chips(ui, p),
@@ -805,10 +805,10 @@ impl App {
         }
     }
 
-    fn draw_center(&mut self, ctx: &egui::Context, p: Palette) {
+    fn draw_center(&mut self, root: &mut egui::Ui, p: Palette) {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(20, 16)))
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
@@ -1085,16 +1085,16 @@ impl App {
     }
 
     /// Fixed, resizable console dock below the work area (DSH "tool bench").
-    fn draw_log_panel(&mut self, ctx: &egui::Context, p: Palette) {
+    fn draw_log_panel(&mut self, root: &mut egui::Ui, p: Palette) {
         if !self.log_panel_open {
             return;
         }
-        egui::TopBottomPanel::new(egui::panel::TopBottomSide::Bottom, "log_panel")
+        egui::Panel::bottom("log_panel")
             .resizable(true)
-            .default_height(190.0)
-            .height_range(90.0..=420.0)
+            .default_size(190.0)
+            .size_range(90.0..=420.0)
             .frame(Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(16, 8)))
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("运行日志").size(12.0).strong().color(p.text));
                     ui.label(
@@ -1157,11 +1157,11 @@ impl App {
             });
     }
 
-    fn draw_status(&mut self, ctx: &egui::Context, p: Palette) {
-        egui::TopBottomPanel::new(egui::panel::TopBottomSide::Bottom, "status_bar")
-            .exact_height(38.0)
+    fn draw_status(&mut self, root: &mut egui::Ui, p: Palette) {
+        egui::Panel::bottom("status_bar")
+            .exact_size(38.0)
             .frame(Frame::new().fill(p.sidebar).inner_margin(egui::Margin::symmetric(16, 6)))
-            .show(ctx, |ui| {
+            .show(root, |ui| {
                 ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(Vec2::new(10.0, 10.0), Sense::hover());
                     let color = if self.busy {
@@ -1209,7 +1209,10 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.37 hands the root `Ui` to the app instead of a `Context`.
+        // Keep a clone of the context for input, repaint and global style calls.
+        let ctx = root.ctx().clone();
         self.pump();
         // Keep the watcher in sync with UI state: never poll USB while a job
         // owns the debug probe, and honour the settings toggle.
@@ -1225,29 +1228,29 @@ impl eframe::App for App {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect()
         });
         for path in dropped {
             self.set_firmware(path);
         }
 
-        self.draw_top(ctx, p);
+        self.draw_top(root, p);
         // The top bar (or the settings sidebar) may have toggled the theme
         // mid-frame. Refresh the palette so the rail and every other panel are
         // painted with the new theme immediately, not one frame later.
         let p = theme::palette(self.theme);
-        self.draw_status(ctx, p);
-        self.draw_log_panel(ctx, p);
-        self.draw_rail(ctx, p);
-        self.draw_sidebar(ctx, p);
-        self.draw_center(ctx, p);
+        self.draw_status(root, p);
+        self.draw_log_panel(root, p);
+        self.draw_rail(root, p);
+        self.draw_sidebar(root, p);
+        self.draw_center(root, p);
         self.persist();
 
         // Keep egui's global Visuals (checkboxes, selectable labels, scroll
         // bars...) in sync with our custom palette, whatever the toggle source.
         if self.applied_theme != self.theme {
-            theme::apply(ctx, self.theme);
+            theme::apply(&ctx, self.theme);
             self.applied_theme = self.theme;
             ctx.request_repaint();
         }
