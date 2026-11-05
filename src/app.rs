@@ -443,7 +443,7 @@ impl App {
                             self.log_panel_open = !self.log_panel_open;
                         }
                         ui.label(
-                            RichText::new(format!("probe-rs 内置 {} 型号", self.chips.len()))
+                            RichText::new(format!("芯片库 {} 型号", self.chips.len()))
                                 .size(11.0)
                                 .color(p.text3),
                         );
@@ -686,13 +686,25 @@ impl App {
                                 )
                                 .fill(Color32::TRANSPARENT),
                             );
-                            ui.label(RichText::new(&c.family).size(9.0).color(p.text3));
+                            let family = if c.external {
+                                format!("{} · 扩展包", c.family)
+                            } else {
+                                c.family.clone()
+                            };
+                            ui.label(
+                                RichText::new(family)
+                                    .size(9.0)
+                                    .color(if c.external { p.accent } else { p.text3 }),
+                            );
                             if r.clicked() {
                                 self.cfg.chip = c.name.clone();
                                 self.chip_details.clear();
                                 let tx = self.tx.clone();
                                 backend::spawn(
-                                    Job::ChipInfo { chip: c.name.clone() },
+                                    Job::ChipInfo {
+                                        chip: c.name.clone(),
+                                        cfg: Box::new(self.cfg.clone()),
+                                    },
                                     tx,
                                 );
                             }
@@ -756,6 +768,11 @@ impl App {
         });
         ui.add_space(12.0);
         ui.label(RichText::new("外部芯片描述 (.yaml)").size(11.0).color(p.text3));
+        ui.label(
+            RichText::new("程序同目录 targets/*.yaml 会在启动时自动加载")
+                .size(9.0)
+                .color(p.text3),
+        );
         let desc = self
             .cfg
             .chip_description
@@ -897,7 +914,13 @@ impl App {
                                 }
                                 if Self::ghost_button(ui, p, "芯片详情", !self.busy).clicked() {
                                     let chip = self.cfg.chip.clone();
-                                    backend::spawn(Job::ChipInfo { chip }, self.tx.clone());
+                                    backend::spawn(
+                                        Job::ChipInfo {
+                                            chip,
+                                            cfg: Box::new(self.cfg.clone()),
+                                        },
+                                        self.tx.clone(),
+                                    );
                                     self.nav = Nav::Chips;
                                 }
                                 if !self.chip_details.is_empty() {

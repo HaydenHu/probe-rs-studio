@@ -18,7 +18,7 @@
 ## 功能
 
 - 探针枚举、按设备身份选择、连接测试；USB 插入/拔出自动检测（1.5 秒轮询 + 去抖），烧录期间自动暂停轮询
-- 内置约 4700 个芯片型号，可搜索、查看内存布局与 Flash 算法，支持外部 `.yaml` 芯片描述
+- 内置约 4700 个芯片型号，另附 Holychip HC32F4XX 系列（由 CMSIS-Pack 转换）；可搜索、查看内存布局与 Flash 算法，支持外部 `.yaml` 芯片描述
 - HEX / ELF / BIN 固件解析（地址区间、记录数、SHA256），支持拖拽载入
 - 一键烧录、库内 verify、独立读回 SHA256 比对、烧录前读回备份、复位运行、整片擦除（二次确认）
 - 深浅双主题、SVG 矢量导航图标（运行时用 epaint 直接绘制，无位图纹理）、可折叠日志台、进度与状态栏
@@ -62,6 +62,36 @@ probe-rs = { path = "../probe-rs/probe-rs", default-features = false, features =
 
 `.cargo/config.example.toml` 里还提供了共享 `target-dir` 与国内 crates.io 镜像的可选配置。
 
+## 扩展芯片包
+
+内置芯片描述之外，程序还会加载由 CMSIS-Pack 转换出的 probe-rs target YAML：
+
+| 来源 | 位置 | 说明 |
+| --- | --- | --- |
+| 随程序编译 | `targets/HC32F4XX.yaml` | 通过 `include_str!` 嵌入 exe，单个可执行文件即可运行 |
+| 用户扩展 | exe 同目录 `targets/*.yaml`（或运行目录 `targets/*.yaml`） | 启动时自动扫描，放进去即生效，无需重新编译 |
+| 临时指定 | 设置页「外部芯片描述 (.yaml)」 | 单文件，优先级最高，可覆盖同名 family |
+
+当前附带 `Holychip.HC32F4XX.1.0.7.pack` 生成的 3 个型号：`HC32F401BRCX`（256 KiB Flash）、
+`HC32F401BREX`（512 KiB）、`HC32F401BRGX`（1024 KiB），Cortex-M4 / 192 KiB RAM，
+每个型号带各自容量的 Flash 算法。芯片库中这些条目会标注「· 扩展包」。
+
+添加其它系列时，在 probe-rs 源码中用官方工具转换：
+
+```bash
+cargo run -p target-gen -- pack <厂商.pack> <输出目录>
+```
+
+把生成的 YAML 放进 `targets/` 就会被自动加载；若希望像 HC32F4XX 一样编进 exe，
+把文件加入 `src/backend.rs` 的 `BUNDLED_FAMILIES` 常量即可。
+
+> 注意：`target-gen pack` 会把代码相同、仅 `FlashDevice` 参数不同的算法去重。
+> 本 pack 的 3 个 FLM 恰好属于这种情况，官方输出漏掉了 256K 算法，让
+> `HC32F401BRCX` 误用 512K 算法。仓库里的 `HC32F4XX.yaml` 因此改由
+> `tools/flm_to_yaml.py` 生成：它直接解析解包后的 `.FLM`，按同样规则为每个容量
+> 生成独立算法。脚本输出与官方输出在 512K / 1024K 上逐字段一致（指令 blob、
+> 各入口偏移、超时、扇区）。
+
 ## 自检与诊断
 
 ```bash
@@ -85,6 +115,8 @@ cargo test --release --bin probe-rs-studio
 - 探针：DAPLink `c251:f001`，序列号 `LU_2022_8888`，CMSIS-DAP v1 HID（64 字节报告）
 - 目标：PY32F003x8（Armv6-M，64KB Flash / 8KB RAM）
 - 结果：烧录约 2.54 秒，库内校验 + 独立读回 SHA256 一致 + 复位成功
+- Holychip HC32F4XX：已完成芯片描述解析与 Flash 算法完整性验证（单元测试覆盖 3 个型号、
+  指令 blob、入口偏移、NVM/RAM 区间）。本机暂无该系列硬件，**未做真机烧录验证**。
 
 若所有 DAP 命令零超时响应，多为调试器固件卡死，物理拔插 USB 后恢复；软件层重启设备通常被系统拒绝。
 
@@ -98,5 +130,7 @@ src/firmware.rs   HEX / ELF / BIN 解析与 SHA256
 src/theme.rs      深浅两套配色、CJK 字体安装
 src/icons.rs      SVG 子集解析 + epaint 矢量绘制
 assets/icons/     6 个 SVG 图标 + Windows 任务栏图标 RGBA
-tools/gen_icons.py 由统一几何定义生成 SVG 与 OS 图标
+targets/          CMSIS-Pack 转换出的扩展芯片描述 YAML
+tools/gen_icons.py  由统一几何定义生成 SVG 与 OS 图标
+tools/flm_to_yaml.py 从解包后的 CMSIS-Pack .FLM 离线生成 target YAML
 ```

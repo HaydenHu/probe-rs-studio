@@ -98,6 +98,9 @@ pub struct ProbeItem {
 pub struct ChipItem {
     pub family: String,
     pub name: String,
+    /// True when the family comes from a bundled/user CMSIS-Pack description
+    /// rather than from probe-rs' built-in target registry.
+    pub external: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,7 +116,10 @@ pub enum Level {
 pub enum Job {
     RefreshProbes,
     LoadChips,
-    ChipInfo { chip: String },
+    ChipInfo {
+        chip: String,
+        cfg: Box<FlashConfig>,
+    },
     Connect(Box<FlashConfig>),
     ReadBack(Box<FlashConfig>),
     Flash(Box<FlashConfig>),
@@ -247,7 +253,7 @@ fn run(job: Job, tx: &Sender<Event>) -> Result<String> {
     match job {
         Job::RefreshProbes => refresh_probes(tx),
         Job::LoadChips => load_chips(tx),
-        Job::ChipInfo { chip } => chip_info(&chip, tx),
+        Job::ChipInfo { chip, cfg } => chip_info(&chip, Some(cfg.as_ref()), tx),
         Job::Connect(cfg) => {
             let mut session = connect(&cfg, tx)?;
             let summary = describe_session(&mut session)?;
@@ -479,27 +485,80 @@ fn refresh_probes(tx: &Sender<Event>) -> Result<String> {
     Ok(format!("发现 {count} 个探针"))
 }
 
-fn load_chips(tx: &Sender<Event>) -> Result<String> {
-    log(tx, Level::Info, "加载内置芯片描述库…");
-    let registry = Registry::from_builtin_families();
-    let mut chips = Vec::new();
-    for family in registry.families() {
-        for variant in &family.variants {
-            chips.push(ChipItem {
-                family: family.name.clone(),
-                name: variant.name.clone(),
-            });
+/// Chip families generated from CMSIS-Packs with probe-rs' `target-gen` and
+/// compiled into the binary, so a single executable works without extra files.
+/// `Registry::add_target_family` replaces a family with the same name, which
+/// makes these entries override any built-in family of the same name.
+const BUNDLED_FAMILIES: &[(&str, &str)] = &[(
+    "HC32F4XX.yaml",
+    include_str!("../targets/HC32F4XX.yaml"),
+)];
+
+/// Extra user-supplied chip descriptions: any `*.yaml` / `*.yml` inside a
+/// `targets/` folder next to the executable (or in the current directory).
+/// Dropping in a new pack description is enough - no rebuild required.
+fn user_chip_yamls() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(mut exe) = std::env::current_exe() {
+        exe.pop();
+        dirs.push(exe.join("targets"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let p = cwd.join("targets");
+        if !dirs.contains(&p) {
+            dirs.push(p);
         }
     }
-    let count = chips.len();
-    log(tx, Level::Info, format!("内置 {count} 个型号"));
-    let _ = tx.send(Event::Chips(chips));
-    Ok(format!("已加载 {count} 个芯片型号"))
+
+    let mut files = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !(ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml")) {
+                continue;
+            }
+            // The bundled file is already compiled in; avoid a duplicate load.
+            let is_bundled = BUNDLED_FAMILIES.iter().any(|(name, _)| {
+                path.file_name().and_then(|n| n.to_str()) == Some(*name)
+            });
+            if !is_bundled {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
-fn build_registry(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<Registry> {
+/// The single source of truth for every chip lookup. Layer order:
+/// built-in families -> bundled CMSIS-Packs -> `targets/*.yaml` ->
+/// the explicitly selected `chip_description` (highest priority).
+fn build_registry(cfg: Option<&FlashConfig>, tx: &Sender<Event>) -> Result<Registry> {
     let mut registry = Registry::from_builtin_families();
-    if let Some(path) = &cfg.chip_description {
+
+    for (name, yaml) in BUNDLED_FAMILIES {
+        registry
+            .add_target_family_from_yaml(yaml)
+            .with_context(|| format!("内置芯片包 {name} 解析失败"))?;
+    }
+
+    for path in user_chip_yamls() {
+        let yaml = fs::read_to_string(&path)
+            .with_context(|| format!("无法读取芯片描述文件: {}", path.display()))?;
+        registry
+            .add_target_family_from_yaml(&yaml)
+            .with_context(|| format!("芯片描述文件解析失败: {}", path.display()))?;
+        log(
+            tx,
+            Level::Info,
+            format!("已加载扩展芯片包: {}", path.display()),
+        );
+    }
+
+    if let Some(path) = cfg.and_then(|c| c.chip_description.as_ref()) {
         let yaml = fs::read_to_string(path)
             .with_context(|| format!("无法读取芯片描述文件: {}", path.display()))?;
         registry
@@ -514,11 +573,42 @@ fn build_registry(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<Registry> {
     Ok(registry)
 }
 
-fn chip_info(chip: &str, tx: &Sender<Event>) -> Result<String> {
-    let registry = Registry::from_builtin_families();
+fn load_chips(tx: &Sender<Event>) -> Result<String> {
+    log(tx, Level::Info, "加载芯片描述库…");
+    let builtin: Vec<String> = Registry::from_builtin_families()
+        .families()
+        .iter()
+        .map(|f| f.name.to_ascii_lowercase())
+        .collect();
+    let registry = build_registry(None, tx)?;
+
+    let mut chips = Vec::new();
+    for family in registry.families() {
+        let external = !builtin.contains(&family.name.to_ascii_lowercase());
+        for variant in &family.variants {
+            chips.push(ChipItem {
+                family: family.name.clone(),
+                name: variant.name.clone(),
+                external,
+            });
+        }
+    }
+    let extra = chips.iter().filter(|c| c.external).count();
+    let count = chips.len();
+    log(
+        tx,
+        Level::Info,
+        format!("共 {count} 个型号（含 {extra} 个扩展包型号）"),
+    );
+    let _ = tx.send(Event::Chips(chips));
+    Ok(format!("已加载 {count} 个芯片型号"))
+}
+
+fn chip_info(chip: &str, cfg: Option<&FlashConfig>, tx: &Sender<Event>) -> Result<String> {
+    let registry = build_registry(cfg, tx)?;
     let target = registry
         .get_target_by_name(chip)
-        .with_context(|| format!("芯片 {chip} 不在内置库中"))?;
+        .with_context(|| format!("芯片 {chip} 不在芯片库中"))?;
     let mut lines = vec![format!("型号: {}", target.name)];
     for core in &target.cores {
         lines.push(format!("内核: {} ({:?})", core.name, core.core_type));
@@ -578,7 +668,7 @@ fn connect(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<Session> {
         format!("协议 {} @ {} kHz (请求 {} kHz)", protocol, actual, cfg.speed_khz),
     );
 
-    let registry = build_registry(cfg, tx)?;
+    let registry = build_registry(Some(cfg), tx)?;
     let target = registry
         .get_target_by_name(&cfg.chip)
         .with_context(|| format!("芯片 {} 不在描述库中", cfg.chip))?;
@@ -874,5 +964,47 @@ mod tests {
         // Pure enumeration reorder produces no events at all.
         let (added, removed) = probe_diff(&[a.clone(), b.clone()], &[b, a]);
         assert!(added.is_empty() && removed.is_empty());
+    }
+
+    #[test]
+    fn bundled_hc32f4xx_pack_is_registered_and_flashable() {
+        let mut registry = Registry::from_builtin_families();
+        let family = registry
+            .add_target_family_from_yaml(BUNDLED_FAMILIES[0].1)
+            .expect("bundled HC32F4XX YAML must parse");
+        assert!(
+            family.to_ascii_uppercase().contains("HC32F4"),
+            "unexpected family name: {family}"
+        );
+
+        // 256 / 512 / 1024 KiB variants from the Holychip CMSIS-Pack.
+        let expected = [
+            ("HC32F401BRCX", 0x0004_0000_u64),
+            ("HC32F401BREX", 0x0008_0000_u64),
+            ("HC32F401BRGX", 0x0010_0000_u64),
+        ];
+        for (name, flash_size) in expected {
+            let target = registry
+                .get_target_by_name(name)
+                .unwrap_or_else(|e| panic!("{name} must be in the chip library: {e}"));
+            assert!(
+                !target.flash_algorithms.is_empty(),
+                "{name} needs a flash algorithm to be flashable"
+            );
+            let nvm: u64 = target
+                .memory_map
+                .iter()
+                .filter(|r| r.as_nvm_region().is_some())
+                .map(|r| {
+                    let range = r.address_range();
+                    range.end - range.start
+                })
+                .sum();
+            assert!(nvm >= flash_size, "{name}: NVM {nvm:#x} < {flash_size:#x}");
+            assert!(
+                target.memory_map.iter().any(|r| r.as_ram_region().is_some()),
+                "{name} needs a RAM region for the flash algorithm"
+            );
+        }
     }
 }
