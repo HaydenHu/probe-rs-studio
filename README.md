@@ -18,7 +18,7 @@
 ## 功能
 
 - 探针枚举、按设备身份选择、连接测试；USB 插入/拔出自动检测（1.5 秒轮询 + 去抖），烧录期间自动暂停轮询
-- 内置约 4700 个芯片型号，另附 Holychip HC32F4XX 系列；**内置库没有的芯片可直接导入厂商 `.pack` / `.pack.zip`**（纯 Rust 解析，自动转换并永久保存），支持外部 `.yaml` 芯片描述
+- 内置约 4700 个芯片型号，另附 Holychip HC32F4XX 系列；**内置库没有的芯片可直接导入厂商 `.pack` / `.pack.zip`，或只给一个 `.FLM` 算法自行补全芯片信息**（纯 Rust 解析，自动转换并永久保存），支持外部 `.yaml` 芯片描述
 - HEX / ELF / BIN 固件解析（地址区间、记录数、SHA256），支持拖拽载入
 - 一键烧录、库内 verify、独立读回 SHA256 比对、烧录前读回备份、复位运行、整片擦除（二次确认）
 - 深浅双主题、SVG 矢量导航图标（运行时用 epaint 直接绘制，无位图纹理）、可折叠日志台、进度与状态栏
@@ -102,7 +102,7 @@ probe-rs-studio.exe --pack <厂商.pack> --out <out.yaml>
 - 按 `(FLM, 声明的 Flash 区间)` 生成算法实例，**不做代码内容去重**：不同容量但代码相同的
   FLM 会各自生成独立算法，避免官方 `target-gen` 把 256K 算法误去重的问题
 - 只提取 Flash 算法与内存布局；不导入 SVD、启动文件、外设头文件等非烧录所需内容
-- FLM 需为位置无关代码（绝大多数厂商算法都是）；要求固定加载地址的算法暂不支持
+- `.pack` 导入路径假定 FLM 为位置无关代码（绝大多数厂商算法都是）；需要固定加载地址的算法请用下面的「单个 .FLM 导入」，可显式指定加载地址
 - 同名的 family 会覆盖内置同名描述，日志会显示加载来源
 
 当前附带 `Holychip.HC32F4XX.1.0.7.pack` 的 3 个型号：`HC32F401BRCX`（256 KiB Flash）、
@@ -110,6 +110,48 @@ probe-rs-studio.exe --pack <厂商.pack> --out <out.yaml>
 `tools/flm_to_yaml.py` 是生成这份 bundled YAML 的离线脚本；界面内的转换器是
 `src/pack.rs`（纯 Rust），单测用 `tests/fixtures/` 里的精简 pack 覆盖 ZIP 嵌套、
 pdsc、ELF32 与 Registry 解析。
+
+## 只加载一个 .FLM 算法
+
+厂商只给了 Flash 算法文件、没有完整 `.pack`（或 `.pdsc` 缺失 / 想造一个自定义型号）时，
+也可以直接用单个 `.FLM` 生成一个完整的芯片系列：
+
+- 「芯片库」页 → **加载 .FLM 算法…**；或「设置」页 → **加载 .FLM…**
+- 程序先读取 `.FLM` 内嵌的 `FlashDevice`，把 **Flash 起始地址、容量、页大小、扇区布局、
+  擦除值、编程/擦除超时、代码与各入口函数** 自动填好并显示在弹窗里
+- 只需补充 ELF 里没有的信息：**芯片型号**（逗号分隔可一次建多个共用同一算法的型号）、
+  **系列名称**、**内核**、**RAM 起始地址 / 容量**（默认 `0x20000000` + 64 KiB）、
+  AP 编号（默认 0）。Flash 两项留空即沿用算法自带值，填了则覆盖
+- 可选 **固定加载地址**：仅非位置无关（非 PIC）算法需要，值为算法代码在 RAM 中的起始地址，
+  必须落在声明的 RAM 区间内并给算法头部留出空间
+- 提交后与 `.pack` 走同样的流程：生成 YAML → `Registry` 校验 → 写入 exe 同目录
+  `targets/flm_<系列>.yaml` → 立即刷新芯片库，重启自动加载，标注「· 扩展包」
+
+命令行（无需硬件、无需打开窗口）：
+
+```bash
+# 最小用法：内核默认 armv7em（Cortex-M4/M7），芯片名取 FLM 文件名
+probe-rs-studio.exe --flm MYCHIP.FLM
+
+# 完整参数：两个型号、Cortex-M0+、自定义 RAM 与 Flash 容量
+probe-rs-studio.exe --flm MYCHIP.FLM --chip MYCHIP_A,MYCHIP_B --family "MYCHIP Series" \
+  --core M0+ --flash-base 0x08000000 --flash-size 0x10000 \
+  --ram-base 0x20000000 --ram-size 0x4000
+
+# 只转换不安装，把 YAML 写到指定位置（可再手工放进 targets/）
+probe-rs-studio.exe --flm MYCHIP.FLM --chip MYCHIP_A --out mychip.yaml
+
+# 非 PIC 算法：显式指定代码加载地址与 AP
+probe-rs-studio.exe --flm MYCHIP.FLM --chip MYCHIP_A --load-address 0x20000400 --ap 0
+```
+
+`--core` 接受 `M0` / `M0+` / `M3` / `M4` / `M7` / `M23` / `M33` / `M55` / `M85`
+或 `armv6m` / `armv7m` / `armv7em` / `armv8m`。数字参数支持十进制或 `0x` 十六进制。
+
+**注意**：RAM 必须能容纳算法代码、栈（约 1 KiB）与至少 2 个页缓冲，否则导入时会明确报错；
+部分厂商的多个容量型号共用同一份 FLM，其 `FlashDevice` 声明的容量可能与目标芯片不符，
+此时在弹窗或 `--flash-size` 中改成实际容量。不支持 ZIP64、非 32 位小端 ELF、非 PIC 且
+未指定加载地址的算法。
 
 ## 自检与诊断
 
@@ -123,9 +165,10 @@ probe-rs-studio.exe --selftest <firmware.hex> PY32F003x8 --write
 # 打印调试探针热插拔事件，N 秒内可插拔 USB 观察
 probe-rs-studio.exe --watch 8
 
-# 芯片库检查（无需硬件）/ 导入 CMSIS-Pack
+# 芯片库检查（无需硬件）/ 导入 CMSIS-Pack / 导入单个 .FLM
 probe-rs-studio.exe --chips
 probe-rs-studio.exe --pack <厂商.pack.zip>
+probe-rs-studio.exe --flm <厂商.FLM> --chip <型号> --core M4
 
 # 单元测试（pack 转换、矢量图标、主题配色、热插拔 diff、Registry 解析）
 cargo test --release --bin probe-rs-studio

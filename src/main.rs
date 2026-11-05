@@ -7,6 +7,8 @@ mod icons;
 mod pack;
 mod theme;
 
+use std::path::PathBuf;
+
 /// OS window title (taskbar / Alt-Tab). The in-app top bar deliberately does
 /// not repeat this string — see `Nav::title`.
 pub const WINDOW_TITLE: &str = "ProbeRS Studio";
@@ -119,6 +121,21 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // Headless standalone .FLM import:
+    //   --flm <file> [--chip NAME] [--family NAME] [--core M4]
+    //                [--flash-base 0x08000000] [--flash-size 0x40000]
+    //                [--ram-base 0x20000000] [--ram-size 0x10000]
+    //                [--load-address 0x20000400] [--ap 0] [--out <yaml>]
+    if let Some(pos) = args.iter().position(|a| a == "--flm") {
+        match flm_cli(&args, pos) {
+            Ok(()) => std::process::exit(0),
+            Err(err) => {
+                eprintln!("导入 .FLM 失败: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Headless hot-plug diagnostic: probe-rs-studio.exe --watch <seconds>
     if let Some(pos) = args.iter().position(|a| a == "--watch") {
         let secs = args
@@ -149,4 +166,90 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
+}
+
+/// Fetch a `--key value` pair from the argument list.
+fn cli_opt(args: &[String], key: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == key)
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+}
+
+fn cli_u64(args: &[String], key: &str) -> Result<Option<u64>, String> {
+    match cli_opt(args, key) {
+        None => Ok(None),
+        Some(v) => pack::parse_number(&v)
+            .map(Some)
+            .ok_or_else(|| format!("{key} 不是有效的数字: {v}")),
+    }
+}
+
+/// `--flm <file>`: build a chip family from a bare Flash algorithm. Everything
+/// the FLM declares is taken from the file; the chip name, core and RAM layout
+/// come from CLI options (with conventional defaults).
+fn flm_cli(args: &[String], pos: usize) -> Result<(), String> {
+    const USAGE: &str = "用法: probe-rs-studio.exe --flm <file.FLM> [--chip NAME] [--family NAME] \
+        [--core M4] [--flash-base 0x08000000] [--flash-size 0x40000] \
+        [--ram-base 0x20000000] [--ram-size 0x10000] [--out <yaml>]";
+    let file = args.get(pos + 1).ok_or_else(|| USAGE.to_owned())?;
+    let path = PathBuf::from(file);
+    let info = pack::inspect_flm(&path).map_err(|e| format!("{e:#}"))?;
+    println!("算法参数: {}", info.summary());
+    println!(
+        "算法链接地址: {:#x}（位置无关算法可忽略）",
+        info.code_load_address
+    );
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("FLM_CHIP")
+        .to_owned();
+    let chips: Vec<String> = cli_opt(args, "--chip")
+        .unwrap_or_else(|| stem.clone())
+        .split([',', ';'])
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let ap = match cli_u64(args, "--ap")? {
+        Some(v) if v <= u8::MAX as u64 => v as u8,
+        Some(v) => return Err(format!("--ap 超出 0..255: {v}")),
+        None => 0,
+    };
+    let spec = pack::FlmSpec {
+        family: cli_opt(args, "--family").unwrap_or_else(|| format!("{stem} Series")),
+        chips,
+        core: cli_opt(args, "--core").unwrap_or_else(|| "armv7em".to_owned()),
+        flash_base: cli_u64(args, "--flash-base")?,
+        flash_size: cli_u64(args, "--flash-size")?,
+        ram_base: cli_u64(args, "--ram-base")?.unwrap_or(0x2000_0000),
+        ram_size: cli_u64(args, "--ram-size")?.unwrap_or(0x0001_0000),
+        load_address: cli_u64(args, "--load-address")?,
+        ap,
+    };
+
+    // Convert once for the summary; `--out` writes exactly this document,
+    // otherwise the GUI-equivalent import path validates + installs it.
+    let converted = pack::convert_flm(&path, &spec).map_err(|e| format!("{e:#}"))?;
+    println!(
+        "生成 {} 个型号 / 算法 {}: {}",
+        converted.variants.len(),
+        converted.algorithm,
+        converted.variants.join(", ")
+    );
+    match cli_opt(args, "--out") {
+        Some(out) => {
+            std::fs::write(&out, &converted.yaml)
+                .map_err(|e| format!("写出 {out} 失败: {e}"))?;
+            println!("芯片描述: {out}");
+        }
+        None => {
+            let summary = backend::import_flm(&path, &spec).map_err(|e| format!("{e:#}"))?;
+            println!("导入结果: {summary}");
+        }
+    }
+    println!("YAML: {} 字节", converted.yaml.len());
+    Ok(())
 }

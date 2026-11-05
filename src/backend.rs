@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::Sender,
+        mpsc::{Receiver, Sender},
         Arc,
     },
     time::{Duration, Instant},
@@ -26,7 +26,10 @@ use probe_rs::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::firmware::{self, FirmwareFormat, FirmwareInfo};
+use crate::{
+    firmware::{self, FirmwareFormat, FirmwareInfo},
+    pack::FlmSpec,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Protocol {
@@ -122,6 +125,12 @@ pub enum Job {
     },
     /// Import a user-supplied CMSIS-Pack into `targets/`.
     LoadPack(PathBuf),
+    /// Turn a standalone `.FLM` into a chip family with user-supplied
+    /// chip name / core / RAM layout.
+    LoadFlm {
+        path: PathBuf,
+        spec: Box<FlmSpec>,
+    },
     Connect(Box<FlashConfig>),
     ReadBack(Box<FlashConfig>),
     Flash(Box<FlashConfig>),
@@ -257,6 +266,7 @@ fn run(job: Job, tx: &Sender<Event>) -> Result<String> {
         Job::LoadChips => load_chips(tx),
         Job::ChipInfo { chip, cfg } => chip_info(&chip, Some(cfg.as_ref()), tx),
         Job::LoadPack(path) => load_pack(&path, tx),
+        Job::LoadFlm { path, spec } => load_flm(&path, &spec, tx),
         Job::Connect(cfg) => {
             let mut session = connect(&cfg, tx)?;
             let summary = describe_session(&mut session)?;
@@ -650,12 +660,81 @@ fn load_pack(path: &std::path::Path, tx: &Sender<Event>) -> Result<String> {
     ))
 }
 
-/// Headless chip-library check (`--chips`): no hardware needed, prints the
-/// same layered registry the GUI builds.
-pub fn chip_library() -> Result<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let result = load_chips(&tx);
-    drop(tx);
+/// Convert one standalone `.FLM` into a chip family, validate it, persist it
+/// under `targets/` and refresh the chip library shown in the UI.
+fn load_flm(path: &std::path::Path, spec: &FlmSpec, tx: &Sender<Event>) -> Result<String> {
+    log(
+        tx,
+        Level::Info,
+        format!("解析 Flash 算法: {}", path.display()),
+    );
+    let converted = crate::pack::convert_flm(path, spec)?;
+    let info = &converted.info;
+    log(tx, Level::Info, format!("FLM 自带参数: {}", info.summary()));
+    log(tx, Level::Debug, format!("FLM 细节: {}", info.details()));
+    log(
+        tx,
+        Level::Info,
+        format!(
+            "芯片描述: 系列 {} · 型号 {} · 内核 {} · Flash {:#x}+{} KiB · RAM {:#x}+{} KiB",
+            converted.family,
+            converted.variants.join(", "),
+            crate::pack::resolve_core(&spec.core).unwrap_or("?"),
+            spec.flash_base.unwrap_or(info.flash_base),
+            spec.flash_size.unwrap_or(info.flash_size) / 1024,
+            spec.ram_base,
+            spec.ram_size / 1024
+        ),
+    );
+    if spec.load_address.is_none()
+        && info.code_load_address != 0
+        && !(spec.ram_base..spec.ram_base.saturating_add(spec.ram_size))
+            .contains(&info.code_load_address)
+    {
+        log(
+            tx,
+            Level::Warn,
+            format!(
+                "算法链接地址 {:#x} 不在声明的 RAM 内；若该 FLM 不是位置无关代码，请指定固定加载地址",
+                info.code_load_address
+            ),
+        );
+    }
+
+    // Never leave a broken description behind.
+    let mut check = Registry::from_builtin_families();
+    check
+        .add_target_family_from_yaml(&converted.yaml)
+        .context("生成的芯片描述无法被 probe-rs 解析")?;
+    for chip in &converted.variants {
+        check
+            .get_target_by_name(chip)
+            .with_context(|| format!("生成的芯片描述里找不到型号 {chip}"))?;
+    }
+
+    let dest = crate::pack::install_as(
+        &format!("flm_{}", converted.family),
+        &converted.yaml,
+    )?;
+    for chip in &converted.variants {
+        log(tx, Level::Info, format!("新增芯片: {chip}"));
+    }
+    log(
+        tx,
+        Level::Info,
+        format!("芯片描述: {}", dest.display()),
+    );
+    load_chips(tx)?;
+    Ok(format!(
+        "已加载 {} 个型号 / 算法 {} → {}",
+        converted.variants.len(),
+        converted.algorithm,
+        dest.display()
+    ))
+}
+
+/// Mirror background log events to stdout for the headless CLI commands.
+fn print_log_events(rx: Receiver<Event>) {
     while let Ok(event) = rx.try_recv() {
         if let Event::Log(level, msg) = event {
             let tag = match level {
@@ -668,6 +747,15 @@ pub fn chip_library() -> Result<String> {
             println!("    [{tag}] {msg}");
         }
     }
+}
+
+/// Headless chip-library check (`--chips`): no hardware needed, prints the
+/// same layered registry the GUI builds.
+pub fn chip_library() -> Result<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let result = load_chips(&tx);
+    drop(tx);
+    print_log_events(rx);
     result
 }
 
@@ -678,18 +766,16 @@ pub fn import_pack(path: &std::path::Path) -> Result<String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let result = load_pack(path, &tx);
     drop(tx);
-    while let Ok(event) = rx.try_recv() {
-        if let Event::Log(level, msg) = event {
-            let tag = match level {
-                Level::Info => "INFO",
-                Level::Ok => "OK  ",
-                Level::Warn => "WARN",
-                Level::Error => "ERR ",
-                Level::Debug => "DBG ",
-            };
-            println!("    [{tag}] {msg}");
-        }
-    }
+    print_log_events(rx);
+    result
+}
+
+/// Headless counterpart of the GUI's "load .FLM" button (`--flm`).
+pub fn import_flm(path: &std::path::Path, spec: &FlmSpec) -> Result<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let result = load_flm(path, spec, &tx);
+    drop(tx);
+    print_log_events(rx);
     result
 }
 

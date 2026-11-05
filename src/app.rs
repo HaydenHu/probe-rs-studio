@@ -20,6 +20,7 @@ use crate::{
     backend::{self, ChipItem, Event, FlashConfig, Job, Level, ProbeItem, Protocol, WatcherControl},
     firmware::{self, FirmwareFormat, FirmwareInfo},
     icons::{IconKind, IconSet},
+    pack::{self, FlmSpec},
     theme::{self, Palette, ThemeMode},
 };
 
@@ -71,6 +72,96 @@ struct LogEntry {
     msg: String,
 }
 
+/// Supported core architectures for a standalone `.FLM` import.
+const FLM_CORES: &[(&str, &str)] = &[
+    ("armv6m", "Cortex-M0 / M0+"),
+    ("armv7m", "Cortex-M3"),
+    ("armv7em", "Cortex-M4 / M7"),
+    ("armv8m", "Cortex-M23 / M33 / M55 / M85"),
+];
+
+/// State of the "load .FLM" dialog. Everything the algorithm declares is
+/// pre-filled from the ELF; only chip name / core / RAM need user input.
+#[derive(Clone)]
+struct FlmForm {
+    path: PathBuf,
+    info: String,
+    family: String,
+    chips: String,
+    core: String,
+    flash_base: String,
+    flash_size: String,
+    ram_base: String,
+    ram_size: String,
+    load_address: String,
+    ap: String,
+    error: String,
+}
+
+impl FlmForm {
+    fn from_file(path: PathBuf, info: &pack::FlmInfo) -> Self {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("FLM_CHIP")
+            .to_owned();
+        Self {
+            path,
+            info: info.summary(),
+            family: format!("{stem} Series"),
+            chips: stem,
+            core: "armv7em".to_owned(),
+            flash_base: format!("{:#x}", info.flash_base),
+            flash_size: format!("{:#x}", info.flash_size),
+            ram_base: "0x20000000".to_owned(),
+            ram_size: "0x10000".to_owned(),
+            load_address: String::new(),
+            ap: "0".to_owned(),
+            error: String::new(),
+        }
+    }
+
+    fn to_spec(&self) -> Result<FlmSpec, String> {
+        fn number(text: &str, label: &str) -> Result<u64, String> {
+            parse_num(text).ok_or_else(|| format!("{label} 不是有效的数字（支持 0x 前缀）"))
+        }
+        fn optional(text: &str, label: &str) -> Result<Option<u64>, String> {
+            if text.trim().is_empty() {
+                Ok(None)
+            } else {
+                number(text, label).map(Some)
+            }
+        }
+        let chips: Vec<String> = self
+            .chips
+            .split([',', '，', ';', '；'])
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if chips.is_empty() {
+            return Err("请填写至少一个芯片型号".to_owned());
+        }
+        if self.family.trim().is_empty() {
+            return Err("系列名称不能为空".to_owned());
+        }
+        let ap = number(&self.ap, "AP 编号")?;
+        if ap > u8::MAX as u64 {
+            return Err("AP 编号必须在 0..255 之间".to_owned());
+        }
+        Ok(FlmSpec {
+            family: self.family.trim().to_owned(),
+            chips,
+            core: self.core.clone(),
+            flash_base: optional(&self.flash_base, "Flash 起始地址")?,
+            flash_size: optional(&self.flash_size, "Flash 容量")?,
+            ram_base: number(&self.ram_base, "RAM 起始地址")?,
+            ram_size: number(&self.ram_size, "RAM 容量")?,
+            load_address: optional(&self.load_address, "固定加载地址")?,
+            ap: ap as u8,
+        })
+    }
+}
+
 pub struct App {
     icons: IconSet,
     cfg: FlashConfig,
@@ -104,6 +195,8 @@ pub struct App {
     log_panel_open: bool,
     config_path: PathBuf,
     last_saved: String,
+    /// `Some` while the standalone .FLM import dialog is open.
+    flm_form: Option<FlmForm>,
 }
 
 fn parse_num(s: &str) -> Option<u64> {
@@ -178,6 +271,7 @@ impl App {
             log_panel_open: true,
             config_path: path,
             last_saved: String::new(),
+            flm_form: None,
         };
         app.push_log(Level::Info, "ProbeRS Studio 已启动 · 直接链接 probe-rs 库");
         app.push_log(Level::Debug, format!("配置文件: {}", app.config_path.display()));
@@ -670,10 +764,18 @@ impl App {
         if Self::primary_button(ui, p, "加载 CMSIS-Pack…", !self.busy).clicked() {
             self.pick_pack(false);
         }
+        ui.add_space(6.0);
+        if Self::ghost_button(ui, p, "加载 .FLM 算法…", !self.busy).clicked() {
+            self.pick_flm();
+        }
         ui.label(
-            RichText::new("内置库没有的芯片：导入厂商 .pack / .pack.zip，\n自动转换为芯片描述并永久保存。")
-                .size(9.0)
-                .color(p.text3),
+            RichText::new(
+                "内置库没有的芯片：导入厂商 .pack / .pack.zip；\n\
+                 只有单个 .FLM 时也可用它生成新型号（需填内核与 RAM）。\n\
+                 两种方式都会自动转换为芯片描述并永久保存。",
+            )
+            .size(9.0)
+            .color(p.text3),
         );
         ui.add_space(10.0);
         ui.add_sized(
@@ -842,6 +944,9 @@ impl App {
             if ui.button("目录…").clicked() {
                 self.pick_pack(true);
             }
+            if ui.button("加载 .FLM…").clicked() {
+                self.pick_flm();
+            }
         });
         ui.add_space(16.0);
         ui.label(
@@ -863,6 +968,189 @@ impl App {
         };
         if let Some(path) = picked {
             self.start_job(Job::LoadPack(path), "导入 CMSIS-Pack");
+        }
+    }
+
+    /// Choose a standalone `.FLM` and pre-fill its import form from the
+    /// FlashDevice embedded in the ELF.
+    fn pick_flm(&mut self) {
+        if self.busy {
+            self.push_log(Level::Warn, "上一个任务尚未结束，请稍候");
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Flash 算法", &["FLM", "flm"])
+            .pick_file()
+        else {
+            return;
+        };
+        match pack::inspect_flm(&path) {
+            Ok(info) => {
+                self.push_log(
+                    Level::Info,
+                    format!("已选择 .FLM: {} · {}", path.display(), info.summary()),
+                );
+                self.flm_form = Some(FlmForm::from_file(path, &info));
+            }
+            Err(err) => self.push_log(Level::Error, format!("读取 .FLM 失败: {err:#}")),
+        }
+    }
+
+    fn submit_flm(&mut self, form: &FlmForm) {
+        if self.busy {
+            return;
+        }
+        let spec = match form.to_spec() {
+            Ok(spec) => spec,
+            Err(err) => {
+                if let Some(f) = self.flm_form.as_mut() {
+                    f.error = err;
+                }
+                return;
+            }
+        };
+        self.start_job(
+            Job::LoadFlm {
+                path: form.path.clone(),
+                spec: Box::new(spec),
+            },
+            "导入 .FLM 算法",
+        );
+        self.flm_form = None;
+    }
+
+    /// Modal dialog for a bare `.FLM`: only the values the ELF cannot know.
+    fn draw_flm_dialog(&mut self, ctx: &egui::Context, p: Palette) {
+        let mut open = true;
+        let mut cancel = false;
+        let mut submit: Option<FlmForm> = None;
+        if let Some(form) = self.flm_form.as_mut() {
+            egui::Window::new("加载 .FLM 算法")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_width(560.0)
+                .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("用单个 Flash 算法创建新型号")
+                            .size(15.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.label(
+                        RichText::new(form.path.display().to_string())
+                            .size(10.0)
+                            .color(p.text3),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&form.info).size(11.0).color(p.accent));
+                    ui.label(
+                        RichText::new(
+                            "Flash 地址、容量、页大小、扇区、擦除值、超时与入口地址均从 .FLM 自动读取；\n\
+                             只需填写芯片名、内核与 RAM。留空的地址项表示使用 .FLM 自带值。",
+                        )
+                        .size(10.0)
+                        .color(p.text2),
+                    );
+                    ui.add_space(8.0);
+                    ui.separator();
+                    egui::Grid::new("flm_form_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 9.0])
+                        .show(ui, |ui| {
+                            let field = |ui: &mut Ui, value: &mut String, hint: &str| {
+                                ui.add_sized(
+                                    [320.0, 24.0],
+                                    egui::TextEdit::singleline(value).hint_text(hint),
+                                );
+                            };
+                            ui.label(RichText::new("芯片型号（逗号分隔可多个）").color(p.text2));
+                            field(ui, &mut form.chips, "MYCHIP_A, MYCHIP_B");
+                            ui.end_row();
+                            ui.label(RichText::new("系列名称").color(p.text2));
+                            field(ui, &mut form.family, "MYCHIP Series");
+                            ui.end_row();
+                            ui.label(RichText::new("内核").color(p.text2));
+                            let current = FLM_CORES
+                                .iter()
+                                .find(|(v, _)| *v == form.core)
+                                .map(|(_, l)| (*l).to_owned())
+                                .unwrap_or_else(|| form.core.clone());
+                            egui::ComboBox::from_id_salt("flm_core")
+                                .selected_text(current)
+                                .width(310.0)
+                                .show_ui(ui, |ui| {
+                                    for (value, label) in FLM_CORES {
+                                        ui.selectable_value(
+                                            &mut form.core,
+                                            (*value).to_owned(),
+                                            *label,
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label(RichText::new("Flash 起始地址 / 容量").color(p.text2));
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [152.0, 24.0],
+                                    egui::TextEdit::singleline(&mut form.flash_base),
+                                );
+                                ui.add_sized(
+                                    [152.0, 24.0],
+                                    egui::TextEdit::singleline(&mut form.flash_size),
+                                );
+                            });
+                            ui.end_row();
+                            ui.label(RichText::new("RAM 起始地址 / 容量").color(p.text2));
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [152.0, 24.0],
+                                    egui::TextEdit::singleline(&mut form.ram_base),
+                                );
+                                ui.add_sized(
+                                    [152.0, 24.0],
+                                    egui::TextEdit::singleline(&mut form.ram_size),
+                                );
+                            });
+                            ui.end_row();
+                            ui.label(RichText::new("固定加载地址（可选）").color(p.text2));
+                            field(ui, &mut form.load_address, "留空 = 位置无关算法");
+                            ui.end_row();
+                            ui.label(RichText::new("AP 编号").color(p.text2));
+                            field(ui, &mut form.ap, "0");
+                            ui.end_row();
+                        });
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "RAM 需容纳算法代码、栈与至少 2 个页缓冲，默认 64 KiB；\n\
+                             非位置无关的算法才需要填写固定加载地址。",
+                        )
+                        .size(9.5)
+                        .color(p.text3),
+                    );
+                    if !form.error.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(&form.error).color(p.error));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("取消").clicked() {
+                            cancel = true;
+                        }
+                        if Self::primary_button(ui, p, "导入并加载芯片", true).clicked() {
+                            submit = Some(form.clone());
+                        }
+                    });
+                });
+        }
+        if cancel || !open {
+            self.flm_form = None;
+            return;
+        }
+        if let Some(form) = submit {
+            self.submit_flm(&form);
         }
     }
 
@@ -1332,6 +1620,7 @@ impl eframe::App for App {
         self.draw_rail(root, p);
         self.draw_sidebar(root, p);
         self.draw_center(root, p);
+        self.draw_flm_dialog(&ctx, p);
         self.persist();
 
         // Keep egui's global Visuals (checkboxes, selectable labels, scroll
@@ -1399,5 +1688,54 @@ mod tests {
             assert!(unique.insert(title), "duplicate page label {title:?}");
         }
         assert_eq!(unique.len(), pages.len());
+    }
+
+    /// The .FLM dialog must never hand an invalid spec to the backend.
+    #[test]
+    fn flm_form_validates_user_input() {
+        let mut form = FlmForm::from_file(
+            PathBuf::from("C:/algos/MYCHIP_256.FLM"),
+            &pack::FlmInfo {
+                description: "MYCHIP 256K".to_owned(),
+                flash_base: 0x0800_0000,
+                flash_size: 0x4_0000,
+                page_size: 0x400,
+                erased: 0xff,
+                program_timeout: 100,
+                erase_timeout: 500,
+                sectors: vec![(0x800, 0)],
+                blob_size: 364,
+                entry_points: vec![("pc_init", 0x1d)],
+                data_section_offset: 0x168,
+                code_load_address: 0x2000_0000,
+            },
+        );
+        assert_eq!(form.chips, "MYCHIP_256");
+        assert_eq!(form.family, "MYCHIP_256 Series");
+        assert_eq!(form.flash_base, "0x8000000");
+        assert!(form.info.contains("256 KiB"));
+
+        form.chips = "MYCHIP_A，MYCHIP_B; MYCHIP_C".to_owned();
+        form.load_address = String::new();
+        let spec = form.to_spec().unwrap();
+        assert_eq!(spec.chips, vec!["MYCHIP_A", "MYCHIP_B", "MYCHIP_C"]);
+        assert_eq!(spec.flash_base, Some(0x0800_0000));
+        assert_eq!(spec.flash_size, Some(0x4_0000));
+        assert_eq!(spec.ram_base, 0x2000_0000);
+        assert_eq!(spec.ram_size, 0x1_0000);
+        assert_eq!(spec.load_address, None);
+        assert_eq!(spec.core, "armv7em");
+
+        form.flash_base = "留空示例".to_owned();
+        assert!(form.to_spec().is_err(), "non-numeric address");
+        form.flash_base = "0x08000000".to_owned();
+        form.chips = " , ".to_owned();
+        assert!(form.to_spec().is_err(), "no chip name");
+        form.chips = "MYCHIP_A".to_owned();
+        form.ap = "300".to_owned();
+        assert!(form.to_spec().is_err(), "AP out of range");
+        form.ap = "0".to_owned();
+        form.load_address = "0x20000400".to_owned();
+        assert_eq!(form.to_spec().unwrap().load_address, Some(0x2000_0400));
     }
 }

@@ -262,7 +262,7 @@ fn attributes(e: &quick_xml::events::BytesStart<'_>) -> HashMap<String, String> 
         .collect()
 }
 
-fn parse_number(s: &str) -> Option<u64> {
+pub fn parse_number(s: &str) -> Option<u64> {
     let s = s.trim();
     let (radix, digits) = if let Some(hex) = s
         .strip_prefix("0x")
@@ -643,6 +643,10 @@ struct FlashAlgorithm {
     blob: Vec<u8>,
     entry_points: Vec<(&'static str, u64)>,
     data_section_offset: u64,
+    /// Link address of `PrgCode` in the ELF. Informational only: almost all
+    /// algorithms are position independent and are relocated into the chip's
+    /// RAM by probe-rs at flash time.
+    code_load_address: u64,
     device: FlashDevice,
 }
 
@@ -698,7 +702,7 @@ fn parse_flm(bytes: &[u8], name: &str) -> Result<FlashAlgorithm> {
             }
         }
     }
-    let (code_sec, code_data, _load_address) =
+    let (code_sec, code_data, code_load_address) =
         code.ok_or_else(|| anyhow!("{name}: 缺少 PrgCode 段"))?;
     let (data_start, data_bytes) = match data_sec {
         Some((sh, bytes)) => (sh.addr, bytes),
@@ -722,6 +726,7 @@ fn parse_flm(bytes: &[u8], name: &str) -> Result<FlashAlgorithm> {
         blob,
         entry_points,
         data_section_offset: data_start,
+        code_load_address,
         device,
     })
 }
@@ -775,14 +780,23 @@ fn safe_name(raw: &str) -> String {
 struct AlgorithmInstance {
     name: String,
     parsed: FlashAlgorithm,
+    /// Flash range start; `None` means "use the value in FlashDevice".
+    address_start: Option<u64>,
     /// Flash range end taken from the device's <algorithm> declaration.
     address_end: u64,
+    /// Fixed load address for non-position-independent algorithms.
+    load_address: Option<u64>,
 }
 
 fn emit_algorithm(out: &mut String, algo: &AlgorithmInstance) {
     let a = &algo.parsed;
     let d = &a.device;
+    let start = algo.address_start.unwrap_or(d.start);
+    let end = algo.address_end.max(start);
     out.push_str(&format!("- name: {}\n", yaml_string(&algo.name)));
+    if let Some(load) = algo.load_address {
+        out.push_str(&format!("  load_address: {}\n", hex(load)));
+    }
     out.push_str(&format!(
         "  description: {}\n",
         yaml_string(&a.description)
@@ -801,8 +815,8 @@ fn emit_algorithm(out: &mut String, algo: &AlgorithmInstance) {
     ));
     out.push_str("  flash_properties:\n");
     out.push_str("    address_range:\n");
-    out.push_str(&format!("      start: {}\n", hex(d.start)));
-    out.push_str(&format!("      end: {}\n", hex(algo.address_end.max(d.start))));
+    out.push_str(&format!("      start: {}\n", hex(start)));
+    out.push_str(&format!("      end: {}\n", hex(end)));
     out.push_str(&format!("    page_size: {}\n", hex(d.page_size)));
     out.push_str(&format!("    erased_byte_value: {}\n", hex(d.erased as u64)));
     out.push_str(&format!(
@@ -813,7 +827,7 @@ fn emit_algorithm(out: &mut String, algo: &AlgorithmInstance) {
         "    erase_sector_timeout: {}\n",
         d.erase_timeout
     ));
-    let limit = algo.address_end.saturating_sub(d.start);
+    let limit = end.saturating_sub(start);
     let sectors: Vec<(u64, u64)> = d
         .sectors
         .iter()
@@ -1008,7 +1022,9 @@ fn convert_entries(entries: &[ZipEntry]) -> Result<ConvertedPack> {
                         instances.push(AlgorithmInstance {
                             name,
                             parsed,
+                            address_start: None,
                             address_end: end,
+                            load_address: None,
                         });
                         instances.len() - 1
                     }
@@ -1053,6 +1069,284 @@ fn convert_entries(entries: &[ZipEntry]) -> Result<ConvertedPack> {
         release: pdsc.release,
         variants: variants.into_iter().map(|(v, _, _)| v).collect(),
         algorithms: instances.iter().map(|a| a.name.clone()).collect(),
+        yaml,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Standalone .FLM import
+//
+// A bare Flash algorithm carries its own FlashDevice (base address, size, page
+// size, sector layout, timeouts) but knows nothing about the chip name, core
+// or SRAM. Those few values are supplied by the user in the GUI / CLI; the
+// remaining field are taken verbatim from the ELF. This makes a single .FLM
+// enough to create a flashable chip without a full CMSIS-Pack.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct FlmInfo {
+    pub description: String,
+    pub flash_base: u64,
+    pub flash_size: u64,
+    pub page_size: u64,
+    pub erased: u8,
+    pub program_timeout: u64,
+    pub erase_timeout: u64,
+    pub sectors: Vec<(u64, u64)>,
+    pub blob_size: usize,
+    pub entry_points: Vec<(&'static str, u64)>,
+    pub data_section_offset: u64,
+    pub code_load_address: u64,
+}
+
+impl FlmInfo {
+    /// Short human-readable summary shown in the import dialog.
+    pub fn summary(&self) -> String {
+        format!(
+            "{}  ·  Flash {:#x} + {} KiB  ·  页 {} B  ·  {} 个扇区  ·  代码 {} B",
+            if self.description.is_empty() {
+                "未命名算法"
+            } else {
+                &self.description
+            },
+            self.flash_base,
+            self.flash_size / 1024,
+            self.page_size,
+            self.sectors.len(),
+            self.blob_size
+        )
+    }
+
+    /// Detailed diagnostics written to the log when importing the algorithm.
+    pub fn details(&self) -> String {
+        let entries: Vec<String> = self
+            .entry_points
+            .iter()
+            .map(|(name, offset)| format!("{name}={offset:#x}"))
+            .collect();
+        format!(
+            "扇区 {} 个 · 擦除值 {:#x} · 编程/擦除超时 {}/{} ms · 数据段偏移 {:#x} · 入口 {}",
+            self.sectors.len(),
+            self.erased,
+            self.program_timeout,
+            self.erase_timeout,
+            self.data_section_offset,
+            entries.join(", ")
+        )
+    }
+}
+
+fn flm_info(parsed: &FlashAlgorithm) -> FlmInfo {
+    let d = &parsed.device;
+    FlmInfo {
+        description: parsed.description.clone(),
+        flash_base: d.start,
+        flash_size: d.size,
+        page_size: d.page_size,
+        erased: d.erased,
+        program_timeout: d.program_timeout,
+        erase_timeout: d.erase_timeout,
+        sectors: d.sectors.clone(),
+        blob_size: parsed.blob.len(),
+        entry_points: parsed.entry_points.clone(),
+        data_section_offset: parsed.data_section_offset,
+        code_load_address: parsed.code_load_address,
+    }
+}
+
+/// Read a standalone `.FLM` and report the metadata it declares. Used to
+/// pre-fill the GUI import form (and to fail early on a wrong file type).
+pub fn inspect_flm(path: &Path) -> Result<FlmInfo> {
+    let bytes = fs::read(path).with_context(|| format!("无法读取 {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("algorithm.flm");
+    let parsed = parse_flm(&bytes, name)
+        .with_context(|| format!("{} 不是有效的 ELF32 Flash 算法", path.display()))?;
+    Ok(flm_info(&parsed))
+}
+
+/// Accept either an armv* architecture keyword or a Cortex-M name.
+pub fn resolve_core(core: &str) -> Result<&'static str> {
+    let key = core
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_', '-'], "");
+    Ok(match key.as_str() {
+        "armv6m" | "m0" | "m0+" | "cortexm0" | "cortexm0+" => "armv6m",
+        "armv7m" | "m3" | "cortexm3" => "armv7m",
+        "armv7em" | "m4" | "m7" | "cortexm4" | "cortexm7" => "armv7em",
+        "armv8m" | "m23" | "m33" | "m55" | "m85" | "cortexm23" | "cortexm33"
+        | "cortexm55" | "cortexm85" | "starmc1" => "armv8m",
+        _ => core_type(core)?,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct FlmSpec {
+    /// Family name of the generated `ChipFamily` (also used for the filename).
+    pub family: String,
+    /// One or more chip variant names sharing this algorithm.
+    pub chips: Vec<String>,
+    /// `armv6m` / `armv7m` / `armv7em` / `armv8m` or a Cortex-M name.
+    pub core: String,
+    /// `None` means "use FlashDevice's start address".
+    pub flash_base: Option<u64>,
+    /// `None` means "use FlashDevice's size".
+    pub flash_size: Option<u64>,
+    pub ram_base: u64,
+    pub ram_size: u64,
+    /// Only for non-position-independent algorithms (code load address).
+    pub load_address: Option<u64>,
+    pub ap: u8,
+}
+
+#[derive(Debug)]
+pub struct ConvertedFlm {
+    pub family: String,
+    pub variants: Vec<String>,
+    pub algorithm: String,
+    pub info: FlmInfo,
+    pub yaml: String,
+}
+
+fn emit_flm_variant(
+    out: &mut String,
+    chip: &str,
+    core: &str,
+    ap: u8,
+    flash_start: u64,
+    flash_end: u64,
+    ram_base: u64,
+    ram_end: u64,
+    algorithm: &str,
+) {
+    out.push_str(&format!("- name: {}\n", yaml_string(chip)));
+    out.push_str("  cores:\n");
+    out.push_str("  - name: main\n");
+    out.push_str(&format!("    type: {core}\n"));
+    out.push_str("    core_access_options: !Arm\n");
+    out.push_str(&format!("      ap: !v1 {ap}\n"));
+    out.push_str("  memory_map:\n");
+    out.push_str("  - !Nvm\n");
+    out.push_str(&format!("    name: {}\n", yaml_string("FLASH")));
+    out.push_str("    range:\n");
+    out.push_str(&format!("      start: {}\n", hex(flash_start)));
+    out.push_str(&format!("      end: {}\n", hex(flash_end)));
+    out.push_str("    cores:\n    - main\n");
+    out.push_str("    access:\n");
+    out.push_str("      write: false\n");
+    out.push_str("      boot: true\n");
+    out.push_str("  - !Ram\n");
+    out.push_str(&format!("    name: {}\n", yaml_string("RAM")));
+    out.push_str("    range:\n");
+    out.push_str(&format!("      start: {}\n", hex(ram_base)));
+    out.push_str(&format!("      end: {}\n", hex(ram_end)));
+    out.push_str("    cores:\n    - main\n");
+    out.push_str("  flash_algorithms:\n");
+    out.push_str(&format!("  - {algorithm}\n"));
+}
+
+/// Turn one standalone `.FLM` into a complete, flashable probe-rs
+/// `ChipFamily` YAML document.
+pub fn convert_flm(path: &Path, spec: &FlmSpec) -> Result<ConvertedFlm> {
+    let bytes = fs::read(path).with_context(|| format!("无法读取 {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("algorithm.flm");
+    let parsed = parse_flm(&bytes, file_name)
+        .with_context(|| format!("{} 不是有效的 ELF32 Flash 算法", path.display()))?;
+    let info = flm_info(&parsed);
+
+    let core = resolve_core(&spec.core).context("内核类型无效")?;
+    let family = spec.family.trim();
+    if family.is_empty() {
+        bail!("系列名称不能为空");
+    }
+    let variants: Vec<String> = spec
+        .chips
+        .iter()
+        .map(|c| c.trim().to_owned())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if variants.is_empty() {
+        bail!("至少需要一个芯片型号");
+    }
+    let flash_start = spec.flash_base.unwrap_or(info.flash_base);
+    let flash_size = spec.flash_size.unwrap_or(info.flash_size);
+    if flash_size == 0 {
+        bail!("Flash 容量必须大于 0");
+    }
+    let flash_end = flash_start
+        .checked_add(flash_size)
+        .ok_or_else(|| anyhow!("Flash 地址区间溢出"))?;
+    let ram_end = spec
+        .ram_base
+        .checked_add(spec.ram_size)
+        .ok_or_else(|| anyhow!("RAM 地址区间溢出"))?;
+    if spec.ram_size < parsed.blob.len() as u64 + 1024 + info.page_size.saturating_mul(2) {
+        bail!(
+            "RAM 至少需要 {} 字节（代码 {} B + 栈 + 2 个页缓冲 {} B），当前为 {}",
+            parsed.blob.len() as u64 + 1024 + info.page_size.saturating_mul(2),
+            parsed.blob.len(),
+            info.page_size.saturating_mul(2),
+            spec.ram_size
+        );
+    }
+    if let Some(load) = spec.load_address {
+        if load < spec.ram_base.saturating_add(0x100) || load >= ram_end {
+            bail!(
+                "固定加载地址 {load:#x} 必须落在 RAM 区间 {:#x}..{:#x} 内，且与起始地址留出头部空间",
+                spec.ram_base,
+                ram_end
+            );
+        }
+    }
+
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_name);
+    let algorithm = safe_name(stem);
+    let instance = AlgorithmInstance {
+        name: algorithm.clone(),
+        parsed,
+        address_start: Some(flash_start),
+        address_end: flash_end,
+        load_address: spec.load_address,
+    };
+
+    let mut yaml = String::new();
+    yaml.push_str(&format!(
+        "# 由 {} 生成（ProbeRS Studio 单 .FLM 导入）\n",
+        path.display()
+    ));
+    yaml.push_str(&format!("name: {}\n", yaml_string(family)));
+    yaml.push_str("generated_from_pack: false\n");
+    yaml.push_str("variants:\n");
+    for chip in &variants {
+        emit_flm_variant(
+            &mut yaml,
+            chip,
+            core,
+            spec.ap,
+            flash_start,
+            flash_end,
+            spec.ram_base,
+            ram_end,
+            &algorithm,
+        );
+    }
+    yaml.push_str("flash_algorithms:\n");
+    emit_algorithm(&mut yaml, &instance);
+
+    Ok(ConvertedFlm {
+        family: family.to_owned(),
+        variants,
+        algorithm,
+        info,
         yaml,
     })
 }
@@ -1103,7 +1397,13 @@ fn output_stem(path: &Path) -> String {
 /// Write a converted description into `targets/` so it is picked up on the
 /// next registry build and on every subsequent application start.
 pub fn install(path: &Path, yaml: &str) -> Result<PathBuf> {
-    let dest = targets_dir()?.join(format!("{}.yaml", output_stem(path)));
+    install_as(&output_stem(path), yaml)
+}
+
+/// Install a description under an explicit name (used by the .FLM importer,
+/// where the family name is a better filename than the algorithm file name).
+pub fn install_as(name: &str, yaml: &str) -> Result<PathBuf> {
+    let dest = targets_dir()?.join(format!("{}.yaml", safe_name(name)));
     fs::write(&dest, yaml).with_context(|| format!("写入 {} 失败", dest.display()))?;
     Ok(dest)
 }
@@ -1249,5 +1549,155 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(converted.variants.len(), 3);
         assert_eq!(converted.algorithms.len(), 3);
+    }
+
+    // --- standalone .FLM import -------------------------------------------
+
+    /// Each test gets its own directory, so parallel tests never fight over
+    /// the same temporary file. The file name is kept as the original FLM name
+    /// because it becomes the generated flash-algorithm name.
+    fn flm_file(tag: &str) -> PathBuf {
+        let entries = pack_entries_from_bytes(MINI_PACK).unwrap();
+        let bytes = find_entry(&entries, "Flash/HC32F4xx_256.FLM")
+            .unwrap()
+            .data
+            .clone();
+        let dir = std::env::temp_dir().join(format!(
+            "probe-rs-studio-flm-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("HC32F4xx_256.FLM");
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn cleanup_flm(path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    fn flm_spec() -> FlmSpec {
+        FlmSpec {
+            family: "Test FLM Family".to_owned(),
+            chips: vec!["TESTFLM_A".to_owned()],
+            core: "Cortex-M4".to_owned(),
+            flash_base: None,
+            flash_size: None,
+            ram_base: 0x2000_0000,
+            ram_size: 0x0001_0000,
+            load_address: None,
+            ap: 0,
+        }
+    }
+
+    #[test]
+    fn standalone_flm_produces_the_verified_pack_algorithm() {
+        let path = flm_file("verified");
+        let info = inspect_flm(&path).unwrap();
+        assert_eq!(info.flash_base, 0x0800_0000);
+        assert_eq!(info.flash_size, 0x4_0000);
+        assert_eq!(info.page_size, 0x400);
+        assert_eq!(info.erased, 0xff);
+        assert_eq!(info.blob_size, 364);
+        assert_eq!(info.sectors.len(), 3);
+        assert_eq!(info.entry_points[0], ("pc_init", 0x1d));
+        assert!(!info.summary().is_empty());
+
+        let c = convert_flm(&path, &flm_spec()).unwrap();
+        cleanup_flm(&path);
+        assert_eq!(c.family, "Test FLM Family");
+        assert_eq!(c.variants, vec!["TESTFLM_A"]);
+        assert_eq!(c.algorithm, "hc32f4xx_256");
+        // The exact same algorithm blob as the bundled / pack-generated YAML.
+        assert_eq!(instructions(&c.yaml), vec![instructions(BUNDLED)[0].clone()]);
+        for expected in [
+            "type: armv7em",
+            "start: 0x8000000",
+            "end: 0x8040000",
+            "pc_init: 0x1d",
+            "pc_erase_all: 0x5d",
+            "data_section_offset: 0x168",
+            "page_size: 0x400",
+            "erased_byte_value: 0xff",
+            "- !Nvm",
+            "- !Ram",
+            "boot: true",
+            "  - hc32f4xx_256",
+        ] {
+            assert!(c.yaml.contains(expected), "missing {expected}");
+        }
+        assert!(!c.yaml.contains("load_address:"));
+
+        let mut registry = probe_rs::config::Registry::from_builtin_families();
+        registry.add_target_family_from_yaml(&c.yaml).unwrap();
+        let target = registry.get_target_by_name("TESTFLM_A").unwrap();
+        assert_eq!(target.flash_algorithms.len(), 1);
+        assert_eq!(target.memory_map.len(), 2);
+    }
+
+    #[test]
+    fn standalone_flm_honours_overrides_and_multiple_chips() {
+        let path = flm_file("overrides");
+        let mut s = flm_spec();
+        s.chips = vec!["TESTFLM_A".to_owned(), "TESTFLM_B".to_owned()];
+        s.core = "M0+".to_owned();
+        s.flash_base = Some(0x0800_0000);
+        s.flash_size = Some(0x2_0000);
+        s.ram_base = 0x2000_0000;
+        s.ram_size = 0x8000;
+        s.load_address = Some(0x2000_0400);
+        s.ap = 1;
+        let c = convert_flm(&path, &s).unwrap();
+        cleanup_flm(&path);
+        for expected in [
+            "type: armv6m",
+            "ap: !v1 1",
+            "end: 0x8020000",
+            "start: 0x20000000",
+            "end: 0x20008000",
+            "load_address: 0x20000400",
+            "- name: \"TESTFLM_A\"",
+            "- name: \"TESTFLM_B\"",
+        ] {
+            assert!(c.yaml.contains(expected), "missing {expected}");
+        }
+        assert_eq!(c.variants, vec!["TESTFLM_A", "TESTFLM_B"]);
+        let mut registry = probe_rs::config::Registry::from_builtin_families();
+        registry.add_target_family_from_yaml(&c.yaml).unwrap();
+        for chip in ["TESTFLM_A", "TESTFLM_B"] {
+            let target = registry.get_target_by_name(chip).unwrap();
+            assert_eq!(target.flash_algorithms.len(), 1, "{chip}");
+        }
+    }
+
+    #[test]
+    fn standalone_flm_rejects_invalid_specs() {
+        let path = flm_file("invalid");
+        assert_eq!(resolve_core("armv8m").unwrap(), "armv8m");
+        assert_eq!(resolve_core("Cortex-M33").unwrap(), "armv8m");
+        assert_eq!(resolve_core("armv7em").unwrap(), "armv7em");
+        assert!(resolve_core("Cortex-A5").is_err());
+
+        let mut s = flm_spec();
+        s.chips.clear();
+        assert!(convert_flm(&path, &s).is_err(), "empty chip list");
+        s = flm_spec();
+        s.core = "Cortex-A5".to_owned();
+        assert!(convert_flm(&path, &s).is_err(), "unsupported core");
+        s = flm_spec();
+        s.flash_size = Some(0);
+        assert!(convert_flm(&path, &s).is_err(), "zero flash size");
+        s = flm_spec();
+        s.ram_size = 0x100;
+        assert!(convert_flm(&path, &s).is_err(), "RAM too small for the algo");
+        s = flm_spec();
+        s.load_address = Some(0x3000_0000);
+        assert!(convert_flm(&path, &s).is_err(), "load address outside RAM");
+        assert!(inspect_flm(Path::new("no-such-file.FLM")).is_err());
+        cleanup_flm(&path);
     }
 }
