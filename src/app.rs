@@ -70,6 +70,10 @@ struct Settings {
     #[serde(default = "default_true")]
     auto_detect: bool,
     recent: Vec<PathBuf>,
+    /// Chip models the user has actually picked / connected / flashed, newest
+    /// first. `default` keeps settings written by older versions readable.
+    #[serde(default)]
+    recent_chips: Vec<String>,
     addr_text: String,
     size_text: String,
     bin_base_text: String,
@@ -199,6 +203,7 @@ pub struct App {
     connection: Option<String>,
     last_result: Option<(bool, String, f32)>,
     recent: Vec<PathBuf>,
+    recent_chips: Vec<String>,
     addr_text: String,
     size_text: String,
     bin_base_text: String,
@@ -209,6 +214,51 @@ pub struct App {
     last_saved: String,
     /// `Some` while the standalone .FLM import dialog is open.
     flm_form: Option<FlmForm>,
+}
+
+/// How many recently confirmed chip models are kept in the settings file.
+const RECENT_CHIPS_LIMIT: usize = 8;
+
+/// History entries matching the current search text (all of them when the
+/// search box is empty), in most-recently-used order.
+fn matched_recent_chips(history: &[String], needle: &str) -> Vec<String> {
+    let needle = needle.trim().to_ascii_lowercase();
+    history
+        .iter()
+        .filter(|name| needle.is_empty() || name.to_ascii_lowercase().contains(&needle))
+        .cloned()
+        .collect()
+}
+
+/// Stable sort key: recent models first (in recency order); everything else
+/// keeps its original registry order.
+fn recent_chip_rank(history: &[String], name: &str) -> usize {
+    history
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case(name))
+        .unwrap_or(history.len())
+}
+
+/// Push a confirmed model to the front, newest first, case-insensitively
+/// de-duplicated and bounded. Kept free of `App` so it can be unit-tested.
+fn push_recent_chip(history: &mut Vec<String>, name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    history.retain(|c| !c.eq_ignore_ascii_case(name));
+    history.insert(0, name.to_owned());
+    history.truncate(RECENT_CHIPS_LIMIT);
+}
+
+/// Settings written before this feature have no history at all. Seed it with
+/// the model the user had already selected, so the shortcut row is useful the
+/// first time the upgraded build starts instead of staying empty until the
+/// next manual chip pick. An existing history is never overwritten.
+fn seed_recent_chips(history: &mut Vec<String>, current: &str) {
+    if history.is_empty() {
+        push_recent_chip(history, current);
+    }
 }
 
 fn parse_num(s: &str) -> Option<u64> {
@@ -234,17 +284,20 @@ impl App {
         let saved: Option<Settings> = fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
-        let s = saved.unwrap_or_else(|| Settings {
+        let mut s = saved.unwrap_or_else(|| Settings {
             config: FlashConfig::default(),
             theme: ThemeMode::Dark,
             auto_detect: true,
             recent: vec![],
+            recent_chips: vec![],
             addr_text: "0x08000000".to_owned(),
             size_text: "4096".to_owned(),
             bin_base_text: "0x08000000".to_owned(),
             speed_text: "1000".to_owned(),
             chip_search: String::new(),
         });
+        let seeded_chip = s.config.chip.clone();
+        seed_recent_chips(&mut s.recent_chips, &seeded_chip);
         theme::apply(&cc.egui_ctx, s.theme);
 
         let (tx, rx) = channel();
@@ -275,6 +328,7 @@ impl App {
             connection: None,
             last_result: None,
             recent: s.recent,
+            recent_chips: s.recent_chips,
             addr_text: s.addr_text,
             size_text: s.size_text,
             bin_base_text: s.bin_base_text,
@@ -420,6 +474,7 @@ impl App {
             theme: self.theme,
             auto_detect: self.auto_detect,
             recent: self.recent.clone(),
+            recent_chips: self.recent_chips.clone(),
             addr_text: self.addr_text.clone(),
             size_text: self.size_text.clone(),
             bin_base_text: self.bin_base_text.clone(),
@@ -453,12 +508,55 @@ impl App {
         }
     }
 
+    /// Record a chip model the user has just committed to. Newest first,
+    /// case-insensitively de-duplicated and bounded so the sidebar stays compact.
+    fn remember_chip(&mut self, name: &str) {
+        push_recent_chip(&mut self.recent_chips, name);
+    }
+
+    /// Apply a chip choice coming from the library list, a history shortcut or
+    /// the workbench. `load_details` mirrors the original list-click behaviour.
+    fn select_chip(&mut self, name: &str, load_details: bool) {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        self.cfg.chip = name.clone();
+        self.chip_details.clear();
+        self.connection = None;
+        self.remember_chip(&name);
+        if load_details {
+            let tx = self.tx.clone();
+            backend::spawn(
+                Job::ChipInfo {
+                    chip: name,
+                    cfg: Box::new(self.cfg.clone()),
+                },
+                tx,
+            );
+        }
+    }
+
     fn start_job(&mut self, job: Job, label: &str) {
         if self.busy {
             self.push_log(Level::Warn, "上一个任务尚未结束，请稍候");
             return;
         }
         self.sync_config();
+        // A manually typed model becomes "confirmed" as soon as it is used for
+        // a real probe operation, so it joins the recent list too.
+        if matches!(
+            &job,
+            Job::Connect(_)
+                | Job::ReadBack(_)
+                | Job::Flash(_)
+                | Job::VerifyFirmware(_)
+                | Job::EraseAll(_)
+                | Job::Reset(_)
+        ) {
+            let chip = self.cfg.chip.clone();
+            self.remember_chip(&chip);
+        }
         self.busy = true;
         self.busy_label = label.to_owned();
         self.progress = 0.0;
@@ -793,8 +891,35 @@ impl App {
             egui::TextEdit::singleline(&mut self.chip_search).hint_text("搜索型号，如 PY32F003"),
         );
         ui.add_space(4.0);
+        let history = self.recent_chips.clone();
+        // One-tap shortcuts for models the user already confirmed, narrowed by
+        // the very same search text typed above.
+        let recent_matches = matched_recent_chips(&history, &self.chip_search);
+        if !recent_matches.is_empty() {
+            ui.label(RichText::new("最近确认的型号").size(10.0).color(p.text3));
+            let mut picked: Option<String> = None;
+            ui.horizontal_wrapped(|ui| {
+                for name in &recent_matches {
+                    let active = self.cfg.chip.eq_ignore_ascii_case(name);
+                    let btn = egui::Button::new(
+                        RichText::new(name)
+                            .size(10.0)
+                            .color(if active { p.accent } else { p.text2 }),
+                    )
+                    .fill(if active { p.accent_soft } else { p.card_alt });
+                    if ui.add(btn).clicked() {
+                        picked = Some(name.clone());
+                    }
+                }
+            });
+            if let Some(name) = picked {
+                self.select_chip(&name, true);
+                self.chip_search.clear();
+            }
+            ui.add_space(4.0);
+        }
         let needle = self.chip_search.trim().to_ascii_lowercase();
-        let filtered: Vec<&ChipItem> = if needle.is_empty() {
+        let mut filtered: Vec<&ChipItem> = if needle.is_empty() {
             self.chips.iter().collect()
         } else {
             self.chips
@@ -802,10 +927,18 @@ impl App {
                 .filter(|c| c.name.to_ascii_lowercase().contains(&needle))
                 .collect()
         };
+        // Stable sort: recent models first (recency order), everything else
+        // keeps its registry order. Works for both empty and filtered queries.
+        filtered.sort_by_key(|c| recent_chip_rank(&history, &c.name));
+        let order_hint = if history.is_empty() { "" } else { " · 最近置顶" };
         ui.label(
-            RichText::new(format!("匹配 {} / {} 个型号", filtered.len(), self.chips.len()))
-                .size(10.0)
-                .color(p.text3),
+            RichText::new(format!(
+                "匹配 {} / {} 个型号{order_hint}",
+                filtered.len(),
+                self.chips.len()
+            ))
+            .size(10.0)
+            .color(p.text3),
         );
         let extra = self.chips.iter().filter(|c| c.external).count();
         ui.label(
@@ -814,12 +947,14 @@ impl App {
                 .color(p.accent),
         );
         ui.add_space(6.0);
+        let mut picked: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_rows(ui, 34.0, filtered.len(), |ui, range| {
                 for i in range {
                     let c = filtered[i];
                     let selected = self.cfg.chip.eq_ignore_ascii_case(&c.name);
+                    let is_recent = recent_chip_rank(&history, &c.name) < history.len();
                     Frame::new()
                         .fill(if selected { p.accent_soft } else { Color32::TRANSPARENT })
                         .corner_radius(7.0)
@@ -833,31 +968,28 @@ impl App {
                                 )
                                 .fill(Color32::TRANSPARENT),
                             );
-                            let family = if c.external {
+                            let mut family = if c.external {
                                 format!("{} · 扩展包", c.family)
                             } else {
                                 c.family.clone()
                             };
+                            if is_recent {
+                                family.push_str(" · 最近");
+                            }
                             ui.label(
                                 RichText::new(family)
                                     .size(9.0)
-                                    .color(if c.external { p.accent } else { p.text3 }),
+                                    .color(if c.external || is_recent { p.accent } else { p.text3 }),
                             );
                             if r.clicked() {
-                                self.cfg.chip = c.name.clone();
-                                self.chip_details.clear();
-                                let tx = self.tx.clone();
-                                backend::spawn(
-                                    Job::ChipInfo {
-                                        chip: c.name.clone(),
-                                        cfg: Box::new(self.cfg.clone()),
-                                    },
-                                    tx,
-                                );
+                                picked = Some(c.name.clone());
                             }
                         });
                 }
             });
+        if let Some(name) = picked {
+            self.select_chip(&name, true);
+        }
     }
 
     fn sidebar_logs(&mut self, ui: &mut Ui, p: Palette) {
@@ -1293,6 +1425,29 @@ impl App {
                                     );
                                     ui.end_row();
                                 });
+                            if !self.recent_chips.is_empty() {
+                                ui.add_space(6.0);
+                                let recent = self.recent_chips.clone();
+                                let mut picked: Option<String> = None;
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("最近型号").size(10.0).color(p.text3));
+                                    for name in &recent {
+                                        let active = self.cfg.chip.eq_ignore_ascii_case(name);
+                                        let btn = egui::Button::new(
+                                            RichText::new(name)
+                                                .size(10.0)
+                                                .color(if active { p.accent } else { p.text2 }),
+                                        )
+                                        .fill(if active { p.accent_soft } else { p.card_alt });
+                                        if ui.add(btn).clicked() {
+                                            picked = Some(name.clone());
+                                        }
+                                    }
+                                });
+                                if let Some(name) = picked {
+                                    self.select_chip(&name, false);
+                                }
+                            }
                             ui.add_space(10.0);
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.cfg.connect_under_reset, "复位下连接");
@@ -1302,6 +1457,7 @@ impl App {
                                 }
                                 if Self::ghost_button(ui, p, "芯片详情", !self.busy).clicked() {
                                     let chip = self.cfg.chip.clone();
+                                    self.remember_chip(&chip);
                                     backend::spawn(
                                         Job::ChipInfo {
                                             chip,
@@ -1818,5 +1974,88 @@ mod tests {
         let open_first = concat!("with_all_", "files(rfd::FileDialog::new())");
         assert_eq!(source.matches(open_first).count(), 3);
         assert!(source.contains(concat!("全部文件 (*.", "*)")));
+    }
+
+    #[test]
+    fn recent_chips_are_deduplicated_and_bounded() {
+        let mut h = vec![];
+        for name in [
+            "PY32F003x8",
+            "STM32F103C8",
+            "py32f003X8",
+            "  ",
+            "HC32F401BRCX",
+        ] {
+            push_recent_chip(&mut h, name);
+        }
+        assert_eq!(h, vec!["HC32F401BRCX", "py32f003X8", "STM32F103C8"]);
+        for i in 1..=12 {
+            push_recent_chip(&mut h, &format!("CHIP{i}"));
+        }
+        assert_eq!(h.len(), RECENT_CHIPS_LIMIT);
+        assert_eq!(h[0], "CHIP12");
+        assert_eq!(h[7], "CHIP5");
+    }
+
+    #[test]
+    fn recent_chip_search_shortcuts_and_ranking() {
+        let history = vec![
+            "PY32F003x8".to_owned(),
+            "STM32F103C8".to_owned(),
+            "HC32F401BRCX".to_owned(),
+        ];
+        assert_eq!(matched_recent_chips(&history, ""), history);
+        assert_eq!(
+            matched_recent_chips(&history, " stm "),
+            vec!["STM32F103C8".to_owned()]
+        );
+        assert!(matched_recent_chips(&history, "nope").is_empty());
+
+        // Stable sort lifts the history to the front in recency order and
+        // leaves the remaining registry order untouched.
+        let mut names = vec!["AAA", "PY32F003x8", "BBB", "stm32f103c8", "CCC"];
+        names.sort_by_key(|n| recent_chip_rank(&history, n));
+        assert_eq!(
+            names,
+            vec!["PY32F003x8", "stm32f103c8", "AAA", "BBB", "CCC"]
+        );
+    }
+
+    /// Settings written before this feature have no `recent_chips` key.
+    #[test]
+    fn older_settings_without_recent_chips_still_load() {
+        let s = Settings {
+            config: FlashConfig::default(),
+            theme: ThemeMode::Dark,
+            auto_detect: true,
+            recent: vec![],
+            recent_chips: vec!["PY32F003x8".to_owned()],
+            addr_text: "0x08000000".to_owned(),
+            size_text: "4096".to_owned(),
+            bin_base_text: "0x08000000".to_owned(),
+            speed_text: "1000".to_owned(),
+            chip_search: String::new(),
+        };
+        let mut value = serde_json::to_value(&s).unwrap();
+        value.as_object_mut().unwrap().remove("recent_chips");
+        let mut old: Settings = serde_json::from_value(value).unwrap();
+        assert!(old.recent_chips.is_empty());
+        assert_eq!(old.config.chip, s.config.chip);
+        // App::new seeds the empty history with the model already in use.
+        let chip = old.config.chip.clone();
+        seed_recent_chips(&mut old.recent_chips, &chip);
+        assert_eq!(old.recent_chips, vec![old.config.chip.clone()]);
+    }
+
+    #[test]
+    fn history_seed_never_overwrites_real_history() {
+        let mut h = vec![];
+        seed_recent_chips(&mut h, "PY32F003x8");
+        assert_eq!(h, vec!["PY32F003x8"]);
+        seed_recent_chips(&mut h, "STM32F103C8");
+        assert_eq!(h, vec!["PY32F003x8"]);
+        let mut blank = vec![];
+        seed_recent_chips(&mut blank, "   ");
+        assert!(blank.is_empty());
     }
 }
