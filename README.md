@@ -102,6 +102,7 @@ probe-rs-studio.exe --pack <厂商.pack> --out <out.yaml>
 - 按 `(FLM, 声明的 Flash 区间)` 生成算法实例，**不做代码内容去重**：不同容量但代码相同的
   FLM 会各自生成独立算法，避免官方 `target-gen` 把 256K 算法误去重的问题
 - 只提取 Flash 算法与内存布局；不导入 SVD、启动文件、外设头文件等非烧录所需内容
+- FLM 需为位置无关代码（绝大多数厂商算法都是）；要求固定加载地址的算法暂不支持
 - 同名的 family 会覆盖内置同名描述，日志会显示加载来源
 
 当前附带 `Holychip.HC32F4XX.1.0.7.pack` 的 3 个型号：`HC32F401BRCX`（256 KiB Flash）、
