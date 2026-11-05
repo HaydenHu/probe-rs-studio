@@ -1,0 +1,29 @@
+# Optional Cargo settings for ProbeRS Studio
+#
+# Copy this file to .cargo/config.toml (that path is git-ignored) if you want
+# to reuse the settings used during development. None of this is required on a
+# normal network: plain crates.io + github.com works out of the box.
+
+# Mainland-China mirror for crates.io dependencies.
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy-sparse]
+index = "sparse+https://rsproxy.cn/index/"
+
+# If github.com HTTPS is blocked but SSH-over-443 works, uncomment the next
+# two lines and add the matching git rewrite rule below. Cargo's built-in
+# libgit2 does not honour git's insteadOf, so the git CLI must be used.
+#
+# [net]
+# git-fetch-with-cli = true
+#
+#   git config --global url."ssh://git@ssh.github.com:443/".insteadOf https://github.com/
+
+# Optional: share one target directory with a local probe-rs checkout so the
+# dependency tree is compiled only once.
+# [build]
+# target-dir = "../probe-rs/target"

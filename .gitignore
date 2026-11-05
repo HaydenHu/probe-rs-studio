@@ -1,0 +1,16 @@
+# Build output and local Cargo cache
+/target/
+/.cargo/config.toml
+
+# Cargo.lock is generated locally: this project tracks a moving git branch of
+# the probe-rs fork, and local development uses a path override instead.
+Cargo.lock
+
+# Local runtime state / generated artifacts
+probe-rs-studio.exe
+probe-rs-studio.json
+*.log
+*.bin
+*.bmp
+*.hex
+*.elf
