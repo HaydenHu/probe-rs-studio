@@ -19,7 +19,7 @@
 
 - **会话式布局**：左侧窄栏「当前会话」集中连接配置、固件选择、烧录选项与全部操作（可滚动）；右侧会话区是已载入固件的 16 进制查看器（虚拟滚动、8/16/32 字节每行、ASCII 栏、镜像 / 文件原始字节切换）
 - 探针枚举、按设备身份选择、连接测试；USB 插入/拔出自动检测（1.5 秒轮询 + 去抖），烧录期间自动暂停轮询
-- **串口识别**：纯 Rust Win32 FFI 枚举当前在线 COM 口，自动标注 DAPLink / CMSIS-DAP 自带的虚拟串口（VID/PID、接口号、占用状态），2 秒轮询自动刷新
+- **串口识别 + 串口终端**：纯 Rust Win32 FFI 枚举当前在线 COM 口，自动标注 DAPLink / CMSIS-DAP 自带的虚拟串口（VID/PID、接口号、占用状态），2 秒轮询自动刷新；左侧设置波特率等线路参数并独占打开，右侧会话区实时收发，支持文本 / HEX、CRLF、RX/TX 计数
 - 内置约 4700 个芯片型号，另附 Holychip HC32F4XX 系列；**内置库没有的芯片用同一个「加载芯片支持…」入口导入厂商 `.pack` / `.pack.zip`、已解压目录，或只给一个 `.FLM` 算法**（按文件类型自动分流，纯 Rust 解析并永久保存），支持外部 `.yaml` 芯片描述
 - **最近确认的型号**：点选、连接或烧录时自动记录（最多 8 个），搜索框下方给出随输入过滤的快捷按钮，型号列表把历史置顶并标注「· 最近」，工作台也能一键切回；随配置持久化，旧配置自动以当前已选型号作为首条历史
 - HEX / ELF / BIN 固件解析（地址区间、记录数、SHA256），支持拖拽载入
@@ -189,7 +189,7 @@ probe-rs-studio.exe --load MYCHIP.FLM --chip MYCHIP_A --load-address 0x20000400 
 - 文件可直接拖进窗口；格式、SHA256、记录数等信息显示在查看器顶部
 
 底部日志台与状态栏保持不变。其它导航页（芯片库 / 运行日志 / 设置 / 串口识别）共享
-右侧会话区，左侧栏切换为该页的上下文工具。
+右侧会话区，左侧栏切换为该页的上下文工具；串口识别页的右侧会话区是**串口终端**。
 
 ## 串口识别
 
@@ -200,6 +200,32 @@ probe-rs-studio.exe --load MYCHIP.FLM --chip MYCHIP_A --load-address 0x20000400 
 - DAPLink / CMSIS-DAP / J-Link 等调试器自带的虚拟串口会单独标注，计数显示在「连接概览」
 - 每 2 秒检测一次，插入 / 拔出会在日志里提示；设置页的「自动检测」开关同时控制探针与串口监视
 - 全程纯 Rust Win32 FFI，无外部依赖、不启动子进程；`--ports` 可在不开窗口时打印同样结果
+
+### 串口会话：参数、接收区与发送区
+
+「串口识别」页沿用同一套会话式布局，左侧窄栏是**串口设置**，右侧会话区是**串口终端**。
+
+| 分组 | 内容 |
+| --- | --- |
+| 串口设置（左栏） | 在线端口下拉、波特率（可手填，常用值下拉）、数据位 5–8、停止位 1 / 1.5 / 2、校验位 无 / 奇 / 偶 / Mark / Space、流控 无 / XON-XOFF / RTS-CTS、「打开串口 / 关闭串口」、在线端口列表与端口详情 |
+| 串口会话（右栏） | 顶部信息条（端口、参数、RX / TX 累计字节数）、清空接收、接收区、发送区 |
+
+- 默认 `115200 8N1`；参数随 `probe-rs-studio.json` 持久化，**打开期间参数被锁定**，
+  要改参数先关闭串口。端口以独占方式 `CreateFileW` 打开，被其它程序占用会明确报错
+- 后台线程用 `mpsc` 收发命令：`COMMTIMEOUTS` 设成非阻塞读，8 ms 轮询输入队列，
+  收到数据发 `Event::SerialRx` 给 UI，窗口空闲时也按 50 ms 持续重绘，不会漏显或卡住
+- 接收区支持 **文本 / HEX + ASCII 显示**、自动滚动、清空；缓冲是 64 KiB 的滚动窗口，
+  长时间收发不会无限增长
+- 发送区支持**文本**或 **HEX**（如 `41 54 0D 0A`，忽略空格 / `0x` 前缀 / 分隔符）、
+  「追加 CRLF」（仅文本模式生效）、清空输入，点「发送」或按 **Ctrl+Enter** 发出
+- 每次发送回 `Event::SerialTxCount` 更新 TX 计数，并在日志台以 DEBUG 级列出实际发出的字节；
+  **设备拔出会自动关闭串口**并提示，端口列表 2 秒刷新一次
+- 收发全程纯 Rust Win32 FFI（`GetCommState` / `SetCommState` / `ReadFile` / `WriteFile`），
+  不依赖 `serialport` 等第三方 crate
+
+真机验证（DAPLink 虚拟串口 `COM10`，115200 8N1）：打开成功；发送 `Hello`（勾选追加 CRLF）
+→ TX 7 字节，日志 `48 65 6C 6C 6F 0D 0A`；切换 HEX 发送 `41 54 0D 0A` → TX 累计 11 字节，
+日志 `41 54 0D 0A`。RX 回显需要目标板实际向串口发数据或做 TX/RX 短接，本机未接回环设备。
 
 ## 最近确认的型号
 
@@ -235,7 +261,7 @@ probe-rs-studio.exe --load <厂商.FLM> --chip <型号> --core M4
 # 列出当前在线串口（含调试器虚拟串口），无需硬件连接
 probe-rs-studio.exe --ports
 
-# 单元测试（hex 查看器、pack 转换、串口枚举、矢量图标、主题配色、热插拔 diff、Registry 解析）
+# 单元测试（hex 查看器、pack 转换、串口枚举 / 参数 / HEX 解析、矢量图标、主题配色、热插拔 diff、Registry 解析）
 cargo test --release --bin probe-rs-studio
 ```
 
@@ -246,6 +272,8 @@ cargo test --release --bin probe-rs-studio
 - 探针：DAPLink `c251:f001`，序列号 `LU_2022_8888`，CMSIS-DAP v1 HID（64 字节报告）
 - 目标：PY32F003x8（Armv6-M，64KB Flash / 8KB RAM）
 - 结果：烧录约 2.54 秒，库内校验 + 独立读回 SHA256 一致 + 复位成功
+- DAPLink 虚拟串口 `COM10`（`c251:f001`，`MI_00`）：识别为「调试器虚拟串口」；串口终端
+  115200 8N1 打开成功，文本 / HEX 发送与 TX 计数、DEBUG 字节日志均已验证
 - Holychip HC32F4XX：已完成芯片描述解析与 Flash 算法完整性验证（单元测试覆盖 3 个型号、
   指令 blob、入口偏移、NVM/RAM 区间）。本机暂无该系列硬件，**未做真机烧录验证**。
 
@@ -255,11 +283,11 @@ cargo test --release --bin probe-rs-studio
 
 ```
 src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports 分派
-src/app.rs        会话侧栏、16 进制查看器、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
-src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、探针与串口监视、芯片描述导入
+src/app.rs        会话侧栏、16 进制查看器、串口终端 UI、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
+src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、探针与串口监视、串口会话线程、芯片描述导入
 src/pack.rs       CMSIS-Pack 转换器：ZIP / pdsc XML / ELF32 FLM / target YAML（纯 Rust）
 src/firmware.rs   HEX / ELF / BIN 解析与 SHA256
-src/serial.rs     纯 Rust Win32 FFI 串口枚举与 DAPLink 虚拟串口识别
+src/serial.rs     纯 Rust Win32 FFI 串口枚举、线路参数、独占打开与非阻塞收发
 src/theme.rs      深浅两套配色、CJK 字体安装
 src/icons.rs      SVG 子集解析 + epaint 矢量绘制
 assets/icons/     6 个 SVG 图标 + Windows 任务栏图标 RGBA

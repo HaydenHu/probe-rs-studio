@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, Sender},
+        mpsc::{self, Receiver, Sender},
         Arc,
     },
     time::{Duration, Instant},
@@ -152,6 +152,12 @@ pub enum Event {
     ChipDetails(String),
     /// Fresh list of currently attached serial ports (see `spawn_serial_watcher`).
     SerialPorts(Vec<crate::serial::SerialPort>),
+    /// Bytes received by the open serial session.
+    SerialRx(Vec<u8>),
+    /// Number of bytes actually written by the serial session.
+    SerialTxCount(usize),
+    /// Session ended; the string is empty for a user-initiated close.
+    SerialClosed(String),
     Connected(String),
     Progress { value: f32, label: String },
     Finished { ok: bool, summary: String, elapsed: f32 },
@@ -421,6 +427,76 @@ pub fn spawn_serial_watcher(
                 }
                 std::thread::sleep(interval);
             }
+        });
+}
+
+/// Commands sent from the UI to the serial-session worker thread.
+pub enum SerialCommand {
+    Send(Vec<u8>),
+    Close,
+}
+
+/// Own an open COM port in a background thread: poll the input queue, write
+/// outgoing bytes and report both directions as events. `Port`'s `Drop`
+/// closes the handle when this loop ends.
+pub fn spawn_serial_session(
+    name: String,
+    cfg: crate::serial::SerialSettings,
+    tx: Sender<Event>,
+    rx: Receiver<SerialCommand>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("serial-session".to_owned())
+        .spawn(move || {
+            let port = match crate::serial::open_port(&name, cfg) {
+                Ok(port) => port,
+                Err(err) => {
+                    log(&tx, Level::Error, format!("打开 {name} 失败: {err:#}"));
+                    let _ = tx.send(Event::SerialClosed(format!("打开失败: {err:#}")));
+                    return;
+                }
+            };
+            log(&tx, Level::Ok, format!("已打开 {name} · {}", cfg.label()));
+            let mut reason = String::new();
+            loop {
+                match rx.try_recv() {
+                    Ok(SerialCommand::Close) => break,
+                    Ok(SerialCommand::Send(bytes)) => match port.write(&bytes) {
+                        Ok(n) => {
+                            let _ = tx.send(Event::SerialTxCount(n));
+                        }
+                        Err(err) => {
+                            log(&tx, Level::Error, format!("串口写入失败: {err:#}"));
+                            reason = format!("写入失败: {err:#}");
+                            break;
+                        }
+                    },
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        reason = "会话通道已断开".to_owned();
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+                match port.read() {
+                    Ok(bytes) => {
+                        if !bytes.is_empty() {
+                            let _ = tx.send(Event::SerialRx(bytes));
+                        }
+                    }
+                    Err(err) => {
+                        log(&tx, Level::Error, format!("串口读取失败: {err:#}"));
+                        reason = format!("读取失败: {err:#}");
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            log(
+                &tx,
+                Level::Info,
+                format!("{name} 串口会话已结束"),
+            );
+            let _ = tx.send(Event::SerialClosed(reason));
         });
 }
 

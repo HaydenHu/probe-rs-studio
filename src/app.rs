@@ -17,11 +17,14 @@ use egui::{
 };
 
 use crate::{
-    backend::{self, ChipItem, Event, FlashConfig, Job, Level, ProbeItem, Protocol, WatcherControl},
+    backend::{
+        self, ChipItem, Event, FlashConfig, Job, Level, ProbeItem, Protocol, SerialCommand,
+        WatcherControl,
+    },
     firmware::{self, FirmwareFormat, FirmwareInfo},
     icons::{IconKind, IconSet},
     pack::{self, FlmSpec},
-    serial::{self, SerialPort},
+    serial::{self, SerialPort, SerialSettings},
     theme::{self, Palette, ThemeMode},
 };
 
@@ -67,6 +70,28 @@ fn default_true() -> bool {
 /// Guard against accidentally dropping a huge file onto the window. Firmware
 /// images are small; the viewer only keeps this many bytes in memory.
 const HEX_VIEW_LIMIT: usize = 32 * 1024 * 1024;
+
+/// Rolling buffer for the serial terminal's receive pane.
+const SERIAL_RX_LIMIT: usize = 64 * 1024;
+
+fn append_rx(buffer: &mut Vec<u8>, bytes: &[u8], limit: usize) {
+    buffer.extend_from_slice(bytes);
+    if buffer.len() > limit {
+        let drop = buffer.len() - limit;
+        buffer.drain(..drop);
+    }
+}
+
+/// Short log-only preview of an outgoing payload.
+fn preview_bytes(bytes: &[u8]) -> String {
+    let n = bytes.len().min(24);
+    let head: String = bytes[..n].iter().map(|b| format!("{b:02X} ")).collect();
+    if bytes.len() > n {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HexSource {
@@ -179,6 +204,10 @@ struct Settings {
     /// first. `default` keeps settings written by older versions readable.
     #[serde(default)]
     recent_chips: Vec<String>,
+    /// Serial-terminal settings (baud / frame / flow control). `default`
+    /// keeps settings files written by older versions readable.
+    #[serde(default)]
+    serial: SerialSettings,
     addr_text: String,
     size_text: String,
     bin_base_text: String,
@@ -297,6 +326,22 @@ pub struct App {
     /// Currently attached COM ports, maintained by `spawn_serial_watcher`.
     ports: Vec<SerialPort>,
     selected_port: Option<String>,
+    /// Terminal configuration, persisted with the rest of the session.
+    serial_cfg: SerialSettings,
+    serial_baud_text: String,
+    /// Command channel of the running serial-session worker thread.
+    serial_cmd: Option<Sender<SerialCommand>>,
+    serial_open_name: Option<String>,
+    serial_open: bool,
+    serial_error: Option<String>,
+    serial_rx: Vec<u8>,
+    serial_tx_text: String,
+    serial_rx_hex: bool,
+    serial_tx_hex: bool,
+    serial_auto_scroll: bool,
+    serial_append_nl: bool,
+    serial_rx_bytes: usize,
+    serial_tx_bytes: usize,
     chip_search: String,
     chip_details: String,
     firmware: Option<FirmwareInfo>,
@@ -403,6 +448,7 @@ impl App {
             auto_detect: true,
             recent: vec![],
             recent_chips: vec![],
+            serial: SerialSettings::default(),
             addr_text: "0x08000000".to_owned(),
             size_text: "4096".to_owned(),
             bin_base_text: "0x08000000".to_owned(),
@@ -430,6 +476,20 @@ impl App {
             chips: vec![],
             ports: vec![],
             selected_port: None,
+            serial_cfg: s.serial,
+            serial_baud_text: s.serial.baud.to_string(),
+            serial_cmd: None,
+            serial_open_name: None,
+            serial_open: false,
+            serial_error: None,
+            serial_rx: vec![],
+            serial_tx_text: String::new(),
+            serial_rx_hex: false,
+            serial_tx_hex: false,
+            serial_auto_scroll: true,
+            serial_append_nl: true,
+            serial_rx_bytes: 0,
+            serial_tx_bytes: 0,
             chip_search: s.chip_search,
             chip_details: String::new(),
             firmware: None,
@@ -499,8 +559,13 @@ impl App {
         }
     }
 
-    fn pump(&mut self) {
+    /// Returns true when at least one background event was consumed, so the
+    /// UI can schedule another repaint (egui is otherwise idle when nothing
+    /// moves the mouse, which would freeze a live serial terminal).
+    fn pump(&mut self) -> bool {
+        let mut received = false;
         while let Ok(ev) = self.rx.try_recv() {
+            received = true;
             match ev {
                 Event::Log(level, msg) => self.push_log(level, msg),
                 Event::Probes(items) => {
@@ -535,6 +600,34 @@ impl App {
                     {
                         self.selected_port = None;
                     }
+                    if self.serial_open
+                        && self
+                            .serial_open_name
+                            .as_deref()
+                            .is_some_and(|name| !self.ports.iter().any(|p| p.name == name))
+                    {
+                        self.push_log(Level::Warn, "串口设备已拔出，会话自动关闭");
+                        self.close_serial();
+                    }
+                }
+                Event::SerialRx(bytes) => {
+                    self.serial_rx_bytes = self.serial_rx_bytes.saturating_add(bytes.len());
+                    append_rx(&mut self.serial_rx, &bytes, SERIAL_RX_LIMIT);
+                }
+                Event::SerialTxCount(n) => {
+                    self.serial_tx_bytes = self.serial_tx_bytes.saturating_add(n);
+                }
+                Event::SerialClosed(reason) => {
+                    let was_open = self.serial_open;
+                    self.serial_open = false;
+                    self.serial_open_name = None;
+                    self.serial_cmd = None;
+                    if !reason.is_empty() {
+                        self.serial_error = Some(reason.clone());
+                        if was_open {
+                            self.push_log(Level::Error, format!("串口会话结束: {reason}"));
+                        }
+                    }
                 }
                 Event::Connected(text) => self.connection = Some(text),
                 Event::Progress { value, label } => {
@@ -555,6 +648,7 @@ impl App {
                 }
             }
         }
+        received
     }
 
     /// Replace the probe list while keeping the *same physical probe* selected.
@@ -615,6 +709,7 @@ impl App {
             auto_detect: self.auto_detect,
             recent: self.recent.clone(),
             recent_chips: self.recent_chips.clone(),
+            serial: self.serial_cfg,
             addr_text: self.addr_text.clone(),
             size_text: self.size_text.clone(),
             bin_base_text: self.bin_base_text.clone(),
@@ -742,18 +837,84 @@ impl App {
         self.recent.truncate(8);
     }
 
-    fn card(ui: &mut Ui, p: Palette, title: &str, body: impl FnOnce(&mut Ui)) {
-        Frame::new()
-            .fill(p.card)
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(12.0)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new(title).size(14.0).strong().color(p.text));
-                ui.add_space(10.0);
-                body(ui);
-            });
+    fn open_serial(&mut self) {
+        if self.serial_open {
+            return;
+        }
+        let Some(name) = self.selected_port.clone() else {
+            self.push_log(Level::Warn, "请先在左侧选择一个串口");
+            return;
+        };
+        let baud = match self.serial_baud_text.trim().parse::<u32>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                self.serial_error = Some("波特率必须是正整数".to_owned());
+                self.push_log(Level::Error, "波特率无效，请填写如 115200");
+                return;
+            }
+        };
+        let mut cfg = self.serial_cfg;
+        cfg.baud = baud;
+        if let Err(err) = cfg.validate() {
+            self.serial_error = Some(err.clone());
+            self.push_log(Level::Error, format!("串口参数无效: {err}"));
+            return;
+        }
+        self.serial_cfg = cfg;
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        backend::spawn_serial_session(name.clone(), cfg, self.tx.clone(), cmd_rx);
+        self.serial_cmd = Some(cmd_tx);
+        self.serial_open = true;
+        self.serial_open_name = Some(name.clone());
+        self.serial_error = None;
+        self.push_log(Level::Info, format!("正在打开 {name} · {}", cfg.label()));
+    }
+
+    fn close_serial(&mut self) {
+        if let Some(tx) = self.serial_cmd.take() {
+            let _ = tx.send(SerialCommand::Close);
+        }
+        self.serial_open = false;
+        self.serial_open_name = None;
+    }
+
+    fn send_serial(&mut self) {
+        if !self.serial_open {
+            self.push_log(Level::Warn, "请先打开串口再发送数据");
+            return;
+        }
+        let text = self.serial_tx_text.clone();
+        let mut payload = if self.serial_tx_hex {
+            match serial::parse_hex_text(&text) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    self.serial_error = Some(err.clone());
+                    self.push_log(Level::Error, format!("HEX 发送内容无效: {err}"));
+                    return;
+                }
+            }
+        } else {
+            text.into_bytes()
+        };
+        if self.serial_append_nl && !self.serial_tx_hex {
+            payload.extend_from_slice(b"\r\n");
+        }
+        if payload.is_empty() {
+            return;
+        }
+        match &self.serial_cmd {
+            Some(tx) => match tx.send(SerialCommand::Send(payload.clone())) {
+                Ok(()) => {
+                    self.serial_error = None;
+                    self.push_log(
+                        Level::Debug,
+                        format!("TX {} 字节: {}", payload.len(), preview_bytes(&payload)),
+                    );
+                }
+                Err(_) => self.push_log(Level::Error, "串口会话已断开，发送失败"),
+            },
+            None => self.push_log(Level::Error, "串口会话不存在，发送失败"),
+        }
     }
 
     fn primary_button(ui: &mut Ui, p: Palette, text: &str, enabled: bool) -> egui::Response {
@@ -1255,7 +1416,7 @@ impl App {
 
     fn sidebar_serial(&mut self, ui: &mut Ui, p: Palette) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("串口识别").size(13.0).strong().color(p.text));
+            ui.label(RichText::new("串口设置").size(13.0).strong().color(p.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("刷新").clicked() {
                     self.ports = serial::enumerate();
@@ -1276,88 +1437,303 @@ impl App {
                     .color(p.text3),
             );
         });
-        ui.add_space(4.0);
         let vcp = self.ports.iter().filter(|x| x.is_debug_vcp()).count();
         ui.label(
             RichText::new(format!("在线 {} 个 · 调试器虚拟串口 {vcp} 个", self.ports.len()))
                 .size(10.0)
                 .color(p.text3),
         );
-        ui.add_space(10.0);
-        if self.ports.is_empty() {
-            ui.label(RichText::new("未发现串口，请检查 USB 连接").size(11.0).color(p.text3));
-        }
+        ui.add_space(8.0);
+
         let ports = self.ports.clone();
-        for item in &ports {
-            let selected = self.selected_port.as_deref() == Some(item.name.as_str());
-            let highlight = item.is_debug_vcp();
-            Frame::new()
-                .fill(if selected { p.accent_soft } else { p.card })
-                .stroke(Stroke::new(
-                    1.0,
-                    if selected {
-                        p.accent
-                    } else if highlight {
-                        p.accent
-                    } else {
-                        p.border
-                    },
-                ))
-                .corner_radius(9.0)
-                .inner_margin(10.0)
-                .show(ui, |ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(item.name.as_str())
-                                    .size(12.0)
-                                    .strong()
-                                    .color(if highlight { p.accent } else { p.text }),
-                            )
-                            .fill(Color32::TRANSPARENT),
-                        )
-                        .clicked()
-                    {
-                        self.selected_port = Some(item.name.clone());
+        let selected = self.selected_port.clone();
+        let probe_id = self
+            .cfg
+            .probe_id
+            .clone()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let error = self.serial_error.clone();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                Self::section_title(ui, p, "串口参数");
+                ui.add_space(6.0);
+                ui.label(RichText::new("端口").size(10.0).color(p.text3));
+                let current = selected.clone().unwrap_or_else(|| "未选择".to_owned());
+                egui::ComboBox::from_id_salt("serial_port_combo")
+                    .selected_text(RichText::new(current).color(p.text))
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        if ports.is_empty() {
+                            ui.label(RichText::new("未发现串口").size(10.0).color(p.text3));
+                        }
+                        for port in &ports {
+                            let chosen = selected.as_deref() == Some(port.name.as_str());
+                            let text = format!("{} · {}", port.name, port.kind.label());
+                            if ui.selectable_label(chosen, text).clicked() {
+                                self.selected_port = Some(port.name.clone());
+                            }
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.label(RichText::new("波特率").size(10.0).color(p.text3));
+                ui.add_sized(
+                    [ui.available_width(), 24.0],
+                    egui::TextEdit::singleline(&mut self.serial_baud_text).hint_text("115200"),
+                );
+                egui::ComboBox::from_id_salt("serial_baud_presets")
+                    .selected_text("常用波特率…")
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for baud in serial::BAUD_PRESETS {
+                            let text = baud.to_string();
+                            if ui
+                                .selectable_label(self.serial_baud_text == text, &text)
+                                .clicked()
+                            {
+                                self.serial_baud_text = text;
+                            }
+                        }
+                    });
+                ui.add_space(4.0);
+                // Parameters are locked while a session owns the handle; the
+                // worker would otherwise keep the old DCB.
+                let editable = !self.serial_open;
+                ui.add_enabled_ui(editable, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("数据位").size(9.0).color(p.text3));
+                        egui::ComboBox::from_id_salt("serial_databits_combo")
+                            .selected_text(self.serial_cfg.data_bits.to_string())
+                            .width(54.0)
+                            .show_ui(ui, |ui| {
+                                for n in [5u8, 6, 7, 8] {
+                                    ui.selectable_value(
+                                        &mut self.serial_cfg.data_bits,
+                                        n,
+                                        n.to_string(),
+                                    );
+                                }
+                            });
+                        ui.label(RichText::new("停止位").size(9.0).color(p.text3));
+                        egui::ComboBox::from_id_salt("serial_stopbits_combo")
+                            .selected_text(self.serial_cfg.stop_bits.label())
+                            .width(54.0)
+                            .show_ui(ui, |ui| {
+                                for s in [
+                                    serial::StopBits::One,
+                                    serial::StopBits::OneFive,
+                                    serial::StopBits::Two,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.serial_cfg.stop_bits,
+                                        s,
+                                        s.label(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("校验位").size(9.0).color(p.text3));
+                    egui::ComboBox::from_id_salt("serial_parity_combo")
+                        .selected_text(self.serial_cfg.parity.label())
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for q in [
+                                serial::Parity::None,
+                                serial::Parity::Odd,
+                                serial::Parity::Even,
+                                serial::Parity::Mark,
+                                serial::Parity::Space,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.serial_cfg.parity,
+                                    q,
+                                    q.label(),
+                                );
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("流控").size(9.0).color(p.text3));
+                    egui::ComboBox::from_id_salt("serial_flow_combo")
+                        .selected_text(self.serial_cfg.flow.label())
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for f in [
+                                serial::FlowControl::None,
+                                serial::FlowControl::XonXoff,
+                                serial::FlowControl::RtsCts,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.serial_cfg.flow,
+                                    f,
+                                    f.label(),
+                                );
+                            }
+                        });
+                });
+                ui.add_space(8.0);
+                let full = ui.available_width();
+                let mut toggle = None;
+                if self.serial_open {
+                    if Self::sidebar_button(ui, p, "关闭串口", true, false, full).clicked() {
+                        toggle = Some(false);
                     }
+                } else if Self::sidebar_button(
+                    ui,
+                    p,
+                    "打开串口",
+                    selected.is_some(),
+                    true,
+                    full,
+                )
+                .clicked()
+                {
+                    toggle = Some(true);
+                }
+                if toggle == Some(true) {
+                    self.open_serial();
+                } else if toggle == Some(false) {
+                    self.close_serial();
+                }
+                ui.add_space(4.0);
+                let (status, color) = if self.serial_open {
+                    (
+                        format!(
+                            "● 已打开 {} · {}",
+                            self.serial_open_name.as_deref().unwrap_or("?"),
+                            self.serial_cfg.label()
+                        ),
+                        p.success,
+                    )
+                } else {
+                    ("● 未打开".to_owned(), p.text3)
+                };
+                ui.label(RichText::new(status).size(10.0).color(color));
+                if let Some(err) = &error {
+                    ui.label(RichText::new(err).size(9.0).color(p.error));
+                }
+                if self.serial_open {
                     ui.label(
-                        RichText::new(item.kind.label())
-                            .size(10.0)
-                            .color(if highlight { p.accent } else { p.text3 }),
-                    );
-                    ui.label(
-                        RichText::new(item.description.as_str())
+                        RichText::new("参数已锁定，关闭串口后可修改")
                             .size(9.0)
                             .color(p.text3),
                     );
+                }
+                ui.add_space(12.0);
+
+                Self::section_title(ui, p, "在线端口");
+                ui.add_space(6.0);
+                if ports.is_empty() {
                     ui.label(
-                        RichText::new(if item.openable {
-                            "● 可打开"
-                        } else {
-                            "● 被占用 / 不可用"
-                        })
-                        .size(9.0)
-                        .color(if item.openable { p.success } else { p.warn }),
+                        RichText::new("未发现串口，请检查 USB 连接")
+                            .size(10.0)
+                            .color(p.text3),
                     );
-                });
-            ui.add_space(6.0);
-        }
-        ui.add_space(16.0);
-        ui.label(RichText::new("关于虚拟串口").size(12.0).strong().color(p.text));
-        ui.label(
-            RichText::new(
-                "DAPLink / CMSIS-DAP 常把 CDC 虚拟串口与调试接口做在同一个 USB 设备上；\
-                 这里按 VID/PID 与设备描述自动标注，并可与当前探针关联。",
-            )
-            .size(10.0)
-            .color(p.text3),
-        );
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("调试探针仍在工作台的连接配置中选择，不再单独占一个页面。")
-                .size(10.0)
-                .color(p.text3),
-        );
+                }
+                let mut picked: Option<String> = None;
+                for item in &ports {
+                    let active = selected.as_deref() == Some(item.name.as_str());
+                    let highlight = item.is_debug_vcp();
+                    Frame::new()
+                        .fill(if active { p.accent_soft } else { p.card })
+                        .stroke(Stroke::new(
+                            1.0,
+                            if active { p.accent } else { p.border },
+                        ))
+                        .corner_radius(8.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            let label = format!("{} · {}", item.name, item.kind.label());
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(label)
+                                            .size(10.5)
+                                            .color(if highlight { p.accent } else { p.text }),
+                                    )
+                                    .fill(Color32::TRANSPARENT),
+                                )
+                                .clicked()
+                            {
+                                picked = Some(item.name.clone());
+                            }
+                            ui.label(
+                                RichText::new(if item.openable {
+                                    "● 可打开"
+                                } else {
+                                    "● 被占用 / 不可用"
+                                })
+                                .size(9.0)
+                                .color(if item.openable { p.success } else { p.warn }),
+                            );
+                        });
+                    ui.add_space(4.0);
+                }
+                if let Some(name) = picked {
+                    self.selected_port = Some(name);
+                }
+                ui.add_space(12.0);
+
+                if let Some(port) = ports
+                    .iter()
+                    .find(|x| selected.as_deref() == Some(x.name.as_str()))
+                {
+                    let same_probe = port
+                        .vid_pid()
+                        .is_some_and(|id| probe_id.starts_with(&id));
+                    let rows = [
+                        ("设备描述", port.description.clone()),
+                        ("设备对象", port.device_object.clone()),
+                        ("VID:PID", port.vid_pid().unwrap_or_else(|| "—".to_owned())),
+                        (
+                            "USB 接口",
+                            port.interface
+                                .map(|i| format!("MI_{i:02}"))
+                                .unwrap_or_else(|| "—".to_owned()),
+                        ),
+                        ("设备实例 ID", port.instance_id.clone()),
+                        (
+                            "关联当前探针",
+                            if same_probe {
+                                "是 · 同一 USB 设备".to_owned()
+                            } else {
+                                "否".to_owned()
+                            },
+                        ),
+                    ];
+                    egui::CollapsingHeader::new(
+                        RichText::new("端口详情").size(11.0).strong().color(p.text2),
+                    )
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::Grid::new("serial_sidebar_details")
+                            .num_columns(2)
+                            .spacing([8.0, 4.0])
+                            .show(ui, |ui| {
+                                for (key, value) in &rows {
+                                    ui.label(RichText::new(*key).size(9.0).color(p.text3));
+                                    ui.label(
+                                        RichText::new(value.as_str()).size(9.0).color(p.text2),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                    ui.add_space(10.0);
+                }
+                Self::section_title(ui, p, "关于虚拟串口");
+                ui.label(
+                    RichText::new(
+                        "DAPLink / CMSIS-DAP 常把 CDC 虚拟串口与调试接口做在同一个 USB 设备上；\
+                         这里按 VID/PID 与设备描述自动标注。调试探针仍在工作台的连接配置中选择。",
+                    )
+                    .size(9.0)
+                    .color(p.text3),
+                );
+            });
     }
 
     fn sidebar_chips(&mut self, ui: &mut Ui, p: Palette) {
@@ -1839,12 +2215,9 @@ impl App {
             .frame(Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(20, 16)))
             .show(root, |ui| {
                 if self.nav == Nav::Serial {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            self.draw_serial_center(ui, p);
-                        });
+                    // The terminal owns its own scroll areas (receive pane),
+                    // so there must be no outer scrolling container.
+                    self.draw_serial_center(ui, p);
                 } else {
                     self.draw_hex_viewer(ui, p);
                 }
@@ -2126,164 +2499,221 @@ impl App {
             });
     }
 
-    /// The serial page replaces the old duplicated probe list: the centre
-    /// panel shows port details instead of the workbench's flashing form.
+    /// The serial page's session pane: a receive / send terminal.
     fn draw_serial_center(&mut self, ui: &mut Ui, p: Palette) {
-        ui.label(RichText::new("串口识别").size(22.0).strong().color(p.text));
-        ui.label(
-            RichText::new("识别当前连接的串口设备，自动标注 DAPLink / CMSIS-DAP 自带的虚拟串口")
-                .size(12.0)
-                .color(p.text3),
-        );
-        ui.add_space(16.0);
-
-        let total = self.ports.len();
-        let vcp = self.ports.iter().filter(|x| x.is_debug_vcp()).count();
-        let busy = self.ports.iter().filter(|x| !x.openable).count();
-        Self::card(ui, p, "连接概览", |ui| {
-            egui::Grid::new("serial_summary_grid")
-                .num_columns(3)
-                .spacing([36.0, 8.0])
-                .show(ui, |ui| {
-                    for (label, value, color) in [
-                        ("在线串口", total.to_string(), p.text),
-                        ("调试器虚拟串口", vcp.to_string(), p.accent),
-                        (
-                            "被占用 / 不可用",
-                            busy.to_string(),
-                            if busy > 0 { p.warn } else { p.success },
-                        ),
-                    ] {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(label).size(10.0).color(p.text3));
-                            ui.label(RichText::new(value).size(20.0).strong().color(color));
-                        });
-                    }
-                    ui.end_row();
-                });
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new(
-                    "每 2 秒自动检测一次 · 插入 / 拔出调试器时，其虚拟串口会与调试接口一起出现或消失。",
-                )
-                .size(10.0)
-                .color(p.text3),
-            );
-        });
-        ui.add_space(14.0);
-
-        if self.ports.is_empty() {
-            Self::card(ui, p, "端口列表", |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("串口会话").size(22.0).strong().color(p.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = if self.serial_open { "● 已打开" } else { "● 未打开" };
                 ui.label(
-                    RichText::new(
-                        "当前没有检测到串口设备。插入 USB 转串口或带虚拟串口的调试器后，会自动出现在这里。",
-                    )
-                    .size(12.0)
-                    .color(p.text3),
+                    RichText::new(text)
+                        .size(11.0)
+                        .color(if self.serial_open { p.success } else { p.text3 }),
                 );
             });
-            return;
-        }
+        });
+        ui.label(
+            RichText::new("左侧设置波特率与帧格式并打开端口；接收区实时显示数据，发送区支持文本 / HEX")
+                .size(11.0)
+                .color(p.text3),
+        );
+        ui.add_space(10.0);
 
-        let ports = self.ports.clone();
-        let selected = self.selected_port.clone();
-        let probe_id = self
-            .cfg
-            .probe_id
+        // Leave room for the info strip and the send pane even when the
+        // bottom log dock is expanded to its default height.
+        let rx_height = (ui.available_height() - 300.0).max(110.0);
+        let name = self
+            .serial_open_name
             .clone()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let mut picked: Option<String> = None;
-        for port in &ports {
-            let active = selected.as_deref() == Some(port.name.as_str());
-            let same_probe = port
-                .vid_pid()
-                .is_some_and(|id| probe_id.starts_with(&id));
-            let vid_pid = port.vid_pid().unwrap_or_else(|| "—".to_owned());
-            let iface = port
-                .interface
-                .map(|i| format!("MI_{i:02}"))
-                .unwrap_or_else(|| "—".to_owned());
-            let instance = if port.instance_id.is_empty() {
-                "—".to_owned()
-            } else {
-                port.instance_id.clone()
-            };
-            let link = if same_probe {
-                "是 · 与当前调试探针同一 USB 设备".to_owned()
-            } else {
-                "否".to_owned()
-            };
-            let rows = [
-                ("设备描述", port.description.clone()),
-                ("设备对象", port.device_object.clone()),
-                ("VID:PID", vid_pid),
-                ("USB 接口", iface),
-                ("设备实例 ID", instance),
-                ("关联当前探针", link),
-            ];
-            Frame::new()
-                .fill(if active { p.accent_soft } else { p.card })
-                .stroke(Stroke::new(1.0, if active { p.accent } else { p.border }))
-                .corner_radius(12.0)
-                .inner_margin(16.0)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
+            .or_else(|| self.selected_port.clone())
+            .unwrap_or_else(|| "未选择端口".to_owned());
+        let cfg = self.serial_cfg.label();
+        let open = self.serial_open;
+        let rx_total = self.serial_rx_bytes;
+        let tx_total = self.serial_tx_bytes;
+        let mut clear_rx = false;
+        let mut toggle = None;
+        Frame::new()
+            .fill(p.card)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(12.0)
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    for (key, value, color) in [
+                        ("端口", name.clone(), p.text),
+                        ("参数", cfg.clone(), p.accent),
+                        ("RX", format!("{rx_total} 字节"), p.text2),
+                        ("TX", format!("{tx_total} 字节"), p.text2),
+                    ] {
+                        ui.label(RichText::new(key).size(9.0).color(p.text3));
+                        ui.label(RichText::new(value).size(11.0).color(color));
+                        ui.add_space(12.0);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("清空接收").clicked() {
+                        clear_rx = true;
+                    }
+                    if ui
+                        .button(if open { "关闭串口" } else { "打开串口" })
+                        .clicked()
+                    {
+                        toggle = Some(open);
+                    }
+                    if let Some(err) = &self.serial_error {
+                        ui.label(RichText::new(err).size(9.0).color(p.error));
+                    }
+                });
+            });
+        if clear_rx {
+            self.serial_rx.clear();
+        }
+        if toggle == Some(false) {
+            self.close_serial();
+        } else if toggle == Some(true) {
+            self.open_serial();
+        }
+        ui.add_space(10.0);
+
+        let rx_hex = self.serial_rx_hex;
+        let auto_scroll = self.serial_auto_scroll;
+        let rx = self.serial_rx.clone();
+        let rows = rx.len().saturating_add(15) / 16;
+        let rx_text = if rx_hex {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&rx).into_owned()
+        };
+        Frame::new()
+            .fill(p.console)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("接收区").size(12.0).strong().color(p.text));
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.checkbox(&mut self.serial_rx_hex, "HEX 显示");
+                            ui.checkbox(&mut self.serial_auto_scroll, "自动滚动");
+                            ui.label(
+                                RichText::new(format!("{} 字节", rx.len()))
+                                    .size(9.0)
+                                    .color(p.text3),
+                            );
+                        },
+                    );
+                });
+                ui.separator();
+                if rx_hex {
+                    let hex_width = 16 * 3 - 1 + 1;
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new(port.name.as_str())
-                                .size(18.0)
-                                .strong()
-                                .color(p.text),
-                        );
-                        ui.label(
-                            RichText::new(format!("· {}", port.kind.label()))
+                            RichText::new(format!("{:<8}", "OFFSET"))
+                                .monospace()
                                 .size(11.0)
-                                .color(if port.is_debug_vcp() { p.accent } else { p.text2 }),
+                                .color(p.text3),
                         );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(if port.openable {
-                                        "● 可打开"
-                                    } else {
-                                        "● 被占用 / 不可用"
-                                    })
-                                    .size(10.0)
-                                    .color(if port.openable { p.success } else { p.warn }),
-                                );
-                            },
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(format!("{:<hex_width$}", "HEX BYTES"))
+                                .monospace()
+                                .size(11.0)
+                                .color(p.text3),
                         );
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("ASCII").monospace().size(11.0).color(p.text3));
                     });
-                    ui.add_space(8.0);
-                    egui::Grid::new(port.name.as_str())
-                        .num_columns(2)
-                        .spacing([16.0, 5.0])
-                        .show(ui, |ui| {
-                            for (key, value) in &rows {
-                                ui.label(RichText::new(*key).size(10.0).color(p.text3));
-                                ui.label(
-                                    RichText::new(value.as_str()).size(10.0).color(p.text2),
-                                );
-                                ui.end_row();
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(rx_height)
+                        .stick_to_bottom(auto_scroll)
+                        .show_rows(ui, 19.0, rows, |ui, range| {
+                            for row in range {
+                                let (offset, hex, gutter) = format_hex_row(&rx, 0, row, 16, true);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(offset).monospace().size(11.0).color(p.text3),
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.label(RichText::new(hex).monospace().size(11.0).color(p.text));
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new(gutter)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(p.text2),
+                                    );
+                                });
                             }
                         });
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(if active { "已选中" } else { "选中" }).clicked() {
-                            picked = Some(port.name.clone());
-                        }
-                        if ui.button("复制 COM 号").clicked() {
-                            ui.ctx().copy_text(port.name.clone());
-                            self.push_log(Level::Info, format!("已复制 {}", port.name));
-                        }
-                    });
+                } else {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(rx_height)
+                        .stick_to_bottom(auto_scroll)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new(rx_text)
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(p.text2),
+                            );
+                        });
+                }
+            });
+        ui.add_space(10.0);
+
+        let mut send = false;
+        let mut clear_tx = false;
+        Frame::new()
+            .fill(p.card)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new("发送区").size(12.0).strong().color(p.text));
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [ui.available_width(), 52.0],
+                    egui::TextEdit::multiline(&mut self.serial_tx_text)
+                        .hint_text(if self.serial_tx_hex {
+                            "HEX 字节，例如 48 65 6C 6C 6F"
+                        } else {
+                            "输入要发送的文本…"
+                        }),
+                );
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if Self::primary_button(ui, p, "发送", open).clicked() {
+                        send = true;
+                    }
+                    if ui.button("清空输入").clicked() {
+                        clear_tx = true;
+                    }
+                    ui.checkbox(&mut self.serial_append_nl, "追加 CRLF");
+                    ui.checkbox(&mut self.serial_tx_hex, "HEX 发送");
+                    ui.label(
+                        RichText::new("Ctrl + Enter 快捷发送")
+                            .size(9.0)
+                            .color(p.text3),
+                    );
                 });
-            ui.add_space(10.0);
+            });
+        let shortcut = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl);
+        if clear_tx {
+            self.serial_tx_text.clear();
         }
-        if let Some(name) = picked {
-            self.selected_port = Some(name);
+        if send || (shortcut && open) {
+            self.send_serial();
         }
     }
 
@@ -2343,13 +2773,15 @@ impl eframe::App for App {
         // egui 0.37 hands the root `Ui` to the app instead of a `Context`.
         // Keep a clone of the context for input, repaint and global style calls.
         let ctx = root.ctx().clone();
-        self.pump();
+        let got_events = self.pump();
         // Keep the watcher in sync with UI state: never poll USB while a job
         // owns the debug probe, and honour the settings toggle.
         self.watch.enabled.store(self.auto_detect, Ordering::Relaxed);
         self.watch.busy.store(self.busy, Ordering::Relaxed);
-        if self.busy {
-            ctx.request_repaint_after(Duration::from_millis(80));
+        // A live terminal keeps receiving bytes while the window is idle;
+        // without an explicit repaint request egui would never show them.
+        if self.busy || got_events || self.serial_open {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
         let p = theme::palette(self.theme);
 
@@ -2609,6 +3041,7 @@ mod tests {
             auto_detect: true,
             recent: vec![],
             recent_chips: vec!["PY32F003x8".to_owned()],
+            serial: SerialSettings::default(),
             addr_text: "0x08000000".to_owned(),
             size_text: "4096".to_owned(),
             bin_base_text: "0x08000000".to_owned(),
@@ -2703,5 +3136,63 @@ mod tests {
             "文件原始字节"
         );
         assert!(resolve_hex_view(None, HexSource::Image).0.is_empty());
+    }
+
+    /// Serial settings written by older versions have no `serial` key.
+    #[test]
+    fn older_settings_without_serial_config_still_load() {
+        let s = Settings {
+            config: FlashConfig::default(),
+            theme: ThemeMode::Dark,
+            auto_detect: true,
+            recent: vec![],
+            recent_chips: vec![],
+            serial: SerialSettings::default(),
+            addr_text: "0x08000000".to_owned(),
+            size_text: "4096".to_owned(),
+            bin_base_text: "0x08000000".to_owned(),
+            speed_text: "1000".to_owned(),
+            chip_search: String::new(),
+        };
+        let mut value = serde_json::to_value(&s).unwrap();
+        value.as_object_mut().unwrap().remove("serial");
+        let old: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(old.serial, SerialSettings::default());
+        assert_eq!(old.serial.label(), "115200 8N1");
+    }
+
+    #[test]
+    fn receive_buffer_is_a_bounded_rolling_window() {
+        let mut buf = Vec::new();
+        append_rx(&mut buf, b"hello", 8);
+        assert_eq!(buf, b"hello".to_vec());
+        append_rx(&mut buf, b" world!", 8);
+        assert_eq!(buf, b"o world!".to_vec());
+        assert_eq!(preview_bytes(b"HELLO"), "48 45 4C 4C 4F ");
+        assert!(preview_bytes(&[0u8; 40]).ends_with('…'));
+    }
+
+    /// The serial sidebar owns the line settings and the session pane owns
+    /// both the receive and the send area.
+    #[test]
+    fn serial_sidebar_has_line_settings_and_terminal_has_rx_tx_panes() {
+        let source = include_str!("app.rs");
+        for label in [
+            concat!("串口", "参数"),
+            concat!("波", "特率"),
+            concat!("数", "据位"),
+            concat!("校", "验位"),
+            concat!("停", "止位"),
+            concat!("流", "控"),
+            concat!("接", "收区"),
+            concat!("发", "送区"),
+            concat!("HEX ", "发送"),
+            concat!("打开", "串口"),
+        ] {
+            assert!(source.contains(label), "missing terminal UI element: {label}");
+        }
+        assert!(source.contains("spawn_serial_session"));
+        assert!(source.contains("Event::SerialRx(bytes)"));
+        assert!(source.contains("Event::SerialClosed(reason)"));
     }
 }

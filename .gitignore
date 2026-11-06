@@ -15,6 +15,9 @@ probe-rs-studio.json
 *.hex
 *.elf
 
+# Throwaway GUI smoke-test captures and helper scripts
+_tmp_*
+
 # Chip descriptions generated when a user imports a CMSIS-Pack. Keep the one
 # family that is compiled into the executable via include_str!.
 /targets/*.yaml

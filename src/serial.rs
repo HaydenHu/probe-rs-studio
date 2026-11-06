@@ -183,6 +183,264 @@ pub fn com_number(name: &str) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+// ---------------------------------------------------------------------------
+// Serial-port configuration and I/O (still pure Rust + Win32 FFI)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Parity {
+    None,
+    Odd,
+    Even,
+    Mark,
+    Space,
+}
+
+impl Parity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "无 (N)",
+            Self::Odd => "奇校验 (O)",
+            Self::Even => "偶校验 (E)",
+            Self::Mark => "Mark (M)",
+            Self::Space => "Space (S)",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Odd => 1,
+            Self::Even => 2,
+            Self::Mark => 3,
+            Self::Space => 4,
+        }
+    }
+
+    fn letter(self) -> char {
+        match self {
+            Self::None => 'N',
+            Self::Odd => 'O',
+            Self::Even => 'E',
+            Self::Mark => 'M',
+            Self::Space => 'S',
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StopBits {
+    One,
+    OneFive,
+    Two,
+}
+
+impl StopBits {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::One => "1",
+            Self::OneFive => "1.5",
+            Self::Two => "2",
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::One => 0,
+            Self::OneFive => 1,
+            Self::Two => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FlowControl {
+    None,
+    XonXoff,
+    RtsCts,
+}
+
+impl FlowControl {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "无",
+            Self::XonXoff => "XON / XOFF",
+            Self::RtsCts => "RTS / CTS",
+        }
+    }
+}
+
+pub const BAUD_PRESETS: &[u32] = &[
+    1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SerialSettings {
+    pub baud: u32,
+    pub data_bits: u8,
+    pub parity: Parity,
+    pub stop_bits: StopBits,
+    pub flow: FlowControl,
+}
+
+impl Default for SerialSettings {
+    fn default() -> Self {
+        Self {
+            baud: 115200,
+            data_bits: 8,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+            flow: FlowControl::None,
+        }
+    }
+}
+
+impl SerialSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.baud == 0 {
+            return Err("波特率必须大于 0".to_owned());
+        }
+        if !(5..=8).contains(&self.data_bits) {
+            return Err("数据位只能是 5 / 6 / 7 / 8".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Short terminal-style label, e.g. `115200 8N1`.
+    pub fn label(&self) -> String {
+        format!(
+            "{} {}{}{}",
+            self.baud,
+            self.data_bits,
+            self.parity.letter(),
+            self.stop_bits.label()
+        )
+    }
+}
+
+/// DCB bit-field: fBinary (bit0) + DTR enable (bits4-5) + RTS control
+/// (bits12-13), plus the flow-control bits. Kept pure so it is unit-testable.
+fn dcb_flags(flow: FlowControl) -> u32 {
+    const BINARY: u32 = 1 << 0;
+    const OUT_X_CTS_FLOW: u32 = 1 << 2;
+    const DTR_ENABLE: u32 = 1 << 4;
+    const OUT_X: u32 = 1 << 8;
+    const IN_X: u32 = 1 << 9;
+    const RTS_ENABLE: u32 = 1 << 12;
+    const RTS_HANDSHAKE: u32 = 2 << 12;
+    match flow {
+        FlowControl::None => BINARY | DTR_ENABLE | RTS_ENABLE,
+        FlowControl::XonXoff => BINARY | DTR_ENABLE | RTS_ENABLE | OUT_X | IN_X,
+        FlowControl::RtsCts => BINARY | DTR_ENABLE | RTS_HANDSHAKE | OUT_X_CTS_FLOW,
+    }
+}
+
+/// Parse a HEX-send text box: whitespace, commas, dashes, colons and `0x`
+/// prefixes are ignored, so `48 65 6C 6C 6F` and `0x48,0x65` both work.
+pub fn parse_hex_text(text: &str) -> Result<Vec<u8>, String> {
+    let mut digits = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() || matches!(b, b',' | b'-' | b':' | b';' | b'_') {
+            i += 1;
+            continue;
+        }
+        if (b == b'0')
+            && i + 1 < bytes.len()
+            && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+        {
+            i += 2;
+            continue;
+        }
+        digits.push(b);
+        i += 1;
+    }
+    if digits.is_empty() {
+        return Ok(Vec::new());
+    }
+    if digits.len() % 2 != 0 {
+        return Err("HEX 字节数必须为偶数（每两个十六进制字符一组）".to_owned());
+    }
+    let nibble = |c: u8| -> Result<u8, String> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            _ => Err(format!("非法十六进制字符 '{}'", char::from(c))),
+        }
+    };
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.chunks_exact(2) {
+        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Ok(out)
+}
+
+/// An open COM port. `Drop` closes the Win32 handle, so the worker thread
+/// simply ends its loop when the session is closed.
+pub struct Port {
+    handle: isize,
+}
+
+// The raw HANDLE is only ever used by the single worker thread that owns it.
+unsafe impl Send for Port {}
+
+impl Drop for Port {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        windows::close_raw(self.handle);
+    }
+}
+
+impl Port {
+    /// Non-blocking read: returns whatever bytes are already in the driver's
+    /// input queue (never waits for more).
+    pub fn read(&self) -> anyhow::Result<Vec<u8>> {
+        #[cfg(windows)]
+        {
+            windows::read_raw(self.handle).map_err(anyhow::Error::msg)
+        }
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!("串口 I/O 仅支持 Windows")
+        }
+    }
+
+    pub fn write(&self, data: &[u8]) -> anyhow::Result<usize> {
+        #[cfg(windows)]
+        {
+            windows::write_raw(self.handle, data).map_err(anyhow::Error::msg)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = data;
+            anyhow::bail!("串口 I/O 仅支持 Windows")
+        }
+    }
+}
+
+pub fn open_port(name: &str, cfg: SerialSettings) -> anyhow::Result<Port> {
+    cfg.validate().map_err(anyhow::Error::msg)?;
+    let number = name
+        .strip_prefix("COM")
+        .or_else(|| name.strip_prefix("com"))
+        .and_then(|s| s.parse::<u32>().ok());
+    if number.is_none() {
+        anyhow::bail!("不是有效的 COM 端口名: {name}");
+    }
+    #[cfg(windows)]
+    {
+        let handle = windows::open_raw(name, cfg).map_err(anyhow::Error::msg)?;
+        Ok(Port { handle })
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("串口 I/O 仅支持 Windows")
+    }
+}
+
 /// Enumerate the currently attached serial ports. Returns an empty list on
 /// non-Windows platforms and when the registry key cannot be opened.
 pub fn enumerate() -> Vec<SerialPort> {
@@ -298,6 +556,40 @@ mod windows {
         fn SetupDiDestroyDeviceInfoList(set: Handle) -> i32;
     }
 
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const PURGE_ALL: u32 = 0x0000_000F;
+    const MAX_DWORD: u32 = u32::MAX;
+
+    /// Win32 DCB, 28 bytes. The bit-field word is built by `dcb_flags`.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct Dcb {
+        dc_blength: u32,
+        baud_rate: u32,
+        flags: u32,
+        w_reserved: u16,
+        xon_lim: u16,
+        xoff_lim: u16,
+        byte_size: u8,
+        parity: u8,
+        stop_bits: u8,
+        xon_char: u8,
+        xoff_char: u8,
+        error_char: u8,
+        eof_char: u8,
+        evt_char: u8,
+        w_reserved1: u16,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct ComStat {
+        flags: u32,
+        cb_in_que: u32,
+        cb_out_que: u32,
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         fn CreateFileW(
@@ -310,6 +602,32 @@ mod windows {
             template: Handle,
         ) -> Handle;
         fn CloseHandle(handle: Handle) -> i32;
+        fn GetCommState(handle: Handle, dcb: *mut Dcb) -> i32;
+        fn SetCommState(handle: Handle, dcb: *const Dcb) -> i32;
+        fn SetCommTimeouts(handle: Handle, timeouts: *const u32) -> i32;
+        fn SetupComm(handle: Handle, in_queue: u32, out_queue: u32) -> i32;
+        fn PurgeComm(handle: Handle, flags: u32) -> i32;
+        fn ClearCommError(handle: Handle, errors: *mut u32, stat: *mut ComStat) -> i32;
+        fn ReadFile(
+            handle: Handle,
+            buffer: *mut u8,
+            bytes_to_read: u32,
+            bytes_read: *mut u32,
+            overlapped: *mut std::ffi::c_void,
+        ) -> i32;
+        fn WriteFile(
+            handle: Handle,
+            buffer: *const u8,
+            bytes_to_write: u32,
+            bytes_written: *mut u32,
+            overlapped: *mut std::ffi::c_void,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    fn last_error(what: &str) -> String {
+        let code = unsafe { GetLastError() };
+        format!("{what} 失败 (GetLastError={code})")
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -532,6 +850,110 @@ mod windows {
         true
     }
 
+    pub(super) fn open_raw(name: &str, cfg: SerialSettings) -> Result<Handle, String> {
+        let path = wide(&format!("\\\\.\\{name}"));
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0, // COM ports cannot be shared
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                0,
+            )
+        };
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            return Err(last_error(&format!("打开 {name}")));
+        }
+        let fail = |what: &str| -> String {
+            let msg = last_error(what);
+            unsafe {
+                CloseHandle(handle);
+            }
+            msg
+        };
+        unsafe {
+            SetupComm(handle, 8192, 8192);
+            let mut dcb: Dcb = std::mem::zeroed();
+            if GetCommState(handle, &mut dcb) == 0 {
+                return Err(fail("GetCommState"));
+            }
+            dcb.dc_blength = std::mem::size_of::<Dcb>() as u32;
+            dcb.baud_rate = cfg.baud;
+            dcb.byte_size = cfg.data_bits;
+            dcb.parity = cfg.parity.code();
+            dcb.stop_bits = cfg.stop_bits.code();
+            dcb.flags = dcb_flags(cfg.flow);
+            dcb.xon_char = 0x11;
+            dcb.xoff_char = 0x13;
+            dcb.xon_lim = 128;
+            dcb.xoff_lim = 128;
+            if SetCommState(handle, &dcb) == 0 {
+                return Err(fail("SetCommState"));
+            }
+            // MAXDWORD + zero totals: ReadFile returns immediately with the
+            // bytes already queued, so the worker can poll without blocking.
+            let timeouts = [MAX_DWORD, 0, 0, 0, 1000];
+            if SetCommTimeouts(handle, timeouts.as_ptr()) == 0 {
+                return Err(fail("SetCommTimeouts"));
+            }
+            PurgeComm(handle, PURGE_ALL);
+        }
+        Ok(handle)
+    }
+
+    pub(super) fn read_raw(handle: Handle) -> Result<Vec<u8>, String> {
+        let mut errors = 0u32;
+        let mut stat: ComStat = unsafe { std::mem::zeroed() };
+        if unsafe { ClearCommError(handle, &mut errors, &mut stat) } == 0 {
+            return Err(last_error("ClearCommError"));
+        }
+        let queued = stat.cb_in_que.min(4096);
+        if queued == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; queued as usize];
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                buf.as_mut_ptr(),
+                queued,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(last_error("ReadFile"));
+        }
+        buf.truncate(read as usize);
+        Ok(buf)
+    }
+
+    pub(super) fn write_raw(handle: Handle, data: &[u8]) -> Result<usize, String> {
+        let mut written = 0u32;
+        let ok = unsafe {
+            WriteFile(
+                handle,
+                data.as_ptr(),
+                data.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(last_error("WriteFile"));
+        }
+        Ok(written as usize)
+    }
+
+    pub(super) fn close_raw(handle: Handle) {
+        unsafe {
+            CloseHandle(handle);
+        }
+    }
+
     pub(super) fn enumerate() -> Vec<SerialPort> {
         let meta = pnp_ports();
         let mut ports: Vec<SerialPort> = serial_comm()
@@ -645,5 +1067,67 @@ mod tests {
         assert_ne!(before, port.signature());
         port.openable = true;
         assert_eq!(before, port.signature());
+    }
+
+    #[test]
+    fn default_settings_and_terminal_label() {
+        let s = SerialSettings::default();
+        assert_eq!(s.label(), "115200 8N1");
+        assert_eq!(s.parity, Parity::None);
+        assert_eq!(s.stop_bits, StopBits::One);
+        assert!(s.validate().is_ok());
+        assert!(SerialSettings { baud: 0, ..s }.validate().is_err());
+        assert!(SerialSettings { data_bits: 9, ..s }.validate().is_err());
+        assert_eq!(
+            SerialSettings {
+                baud: 9600,
+                data_bits: 7,
+                parity: Parity::Even,
+                stop_bits: StopBits::Two,
+                ..s
+            }
+            .label(),
+            "9600 7E2"
+        );
+    }
+
+    #[test]
+    fn dcb_flow_control_bits_are_distinct() {
+        let none = dcb_flags(FlowControl::None);
+        let xon = dcb_flags(FlowControl::XonXoff);
+        let rts = dcb_flags(FlowControl::RtsCts);
+        assert_ne!(none, xon);
+        assert_ne!(none, rts);
+        assert_ne!(xon, rts);
+        // fBinary must always be set, DTR always enabled.
+        for flags in [none, xon, rts] {
+            assert_ne!(flags & 0x0000_0001, 0);
+            assert_ne!(flags & 0x0000_0010, 0);
+        }
+        assert_ne!(xon & (1 << 8), 0); // fOutX
+        assert_ne!(xon & (1 << 9), 0); // fInX
+        assert_ne!(rts & (1 << 2), 0); // fOutxCtsFlow
+        assert_eq!((rts >> 12) & 0b11, 2); // RTS_CONTROL_HANDSHAKE
+        assert_eq!((none >> 12) & 0b11, 1); // RTS_CONTROL_ENABLE
+    }
+
+    #[test]
+    fn hex_send_text_accepts_separators_and_0x_prefix() {
+        assert_eq!(parse_hex_text("48 65 6C 6C 6F").unwrap(), b"Hello".to_vec());
+        assert_eq!(
+            parse_hex_text("0x48, 0x65-6C:6C_6F").unwrap(),
+            b"Hello".to_vec()
+        );
+        assert!(parse_hex_text("  \n ").unwrap().is_empty());
+        assert!(parse_hex_text("4").is_err());
+        assert!(parse_hex_text("GG").is_err());
+    }
+
+    #[test]
+    fn opening_an_invalid_port_or_name_fails_cleanly() {
+        assert!(open_port("NOT_A_PORT", SerialSettings::default()).is_err());
+        assert!(open_port("COM7", SerialSettings { baud: 0, ..Default::default() }).is_err());
+        #[cfg(windows)]
+        assert!(open_port("COM98765", SerialSettings::default()).is_err());
     }
 }
