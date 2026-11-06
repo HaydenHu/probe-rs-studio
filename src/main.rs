@@ -5,6 +5,7 @@ mod backend;
 mod firmware;
 mod icons;
 mod pack;
+mod serial;
 mod theme;
 
 use std::path::PathBuf;
@@ -82,6 +83,30 @@ fn main() -> eframe::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Headless serial-port listing (no probe required): --ports
+    if args.iter().any(|a| a == "--ports") {
+        let ports = serial::enumerate();
+        for port in &ports {
+            println!(
+                "{:<8} {:<14} VID:PID={:<11} IF={:<5} {} · {}",
+                port.name,
+                port.kind.label(),
+                port.vid_pid().unwrap_or_else(|| "—".to_owned()),
+                port.interface
+                    .map(|i| format!("MI_{i:02}"))
+                    .unwrap_or_else(|| "—".to_owned()),
+                if port.openable { "可打开" } else { "被占用/不可用" },
+                port.description
+            );
+        }
+        println!(
+            "共 {} 个在线串口 · 调试器虚拟串口 {} 个",
+            ports.len(),
+            ports.iter().filter(|p| p.is_debug_vcp()).count()
+        );
+        std::process::exit(0);
     }
 
     // Headless CMSIS-Pack conversion: probe-rs-studio.exe --load|--pack <file> [--out <yaml>]

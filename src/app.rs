@@ -21,13 +21,14 @@ use crate::{
     firmware::{self, FirmwareFormat, FirmwareInfo},
     icons::{IconKind, IconSet},
     pack::{self, FlmSpec},
+    serial::{self, SerialPort},
     theme::{self, Palette, ThemeMode},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Nav {
     Workbench,
-    Devices,
+    Serial,
     Chips,
     Logs,
     Settings,
@@ -39,7 +40,7 @@ impl Nav {
     fn title(self) -> &'static str {
         match self {
             Nav::Workbench => "工作台",
-            Nav::Devices => "调试探针",
+            Nav::Serial => "串口识别",
             Nav::Chips => "芯片库",
             Nav::Logs => "运行日志",
             Nav::Settings => "设置",
@@ -61,6 +62,110 @@ fn with_all_files(dialog: rfd::FileDialog) -> rfd::FileDialog {
 
 fn default_true() -> bool {
     true
+}
+
+/// Guard against accidentally dropping a huge file onto the window. Firmware
+/// images are small; the viewer only keeps this many bytes in memory.
+const HEX_VIEW_LIMIT: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HexSource {
+    /// Decoded firmware image, addressed by its load address.
+    Image,
+    /// Raw bytes of the file on disk.
+    File,
+}
+
+impl HexSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Image => "固件镜像",
+            Self::File => "文件原始字节",
+        }
+    }
+}
+
+/// Cheap-to-clone snapshot of the loaded firmware. `Arc` lets the hex viewer
+/// hold the bytes without borrowing `App` while its controls mutate view state.
+#[derive(Clone)]
+struct FirmwareView {
+    raw: Arc<[u8]>,
+    image: Option<Arc<[u8]>>,
+    image_base: u64,
+}
+
+fn read_file_preview(path: &std::path::Path) -> Vec<u8> {
+    use std::io::Read as _;
+    let Ok(mut file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    while out.len() < HEX_VIEW_LIMIT {
+        let n = file.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    out.truncate(HEX_VIEW_LIMIT);
+    out
+}
+
+fn resolve_hex_view(
+    view: Option<&FirmwareView>,
+    source: HexSource,
+) -> (&[u8], u64, &'static str) {
+    match view {
+        Some(v) if source == HexSource::Image && v.image.is_some() => (
+            v.image.as_deref().unwrap_or(&[]),
+            v.image_base,
+            "固件镜像",
+        ),
+        Some(v) => (&v.raw, 0, "文件原始字节"),
+        None => (&[], 0, "—"),
+    }
+}
+
+/// One classic hex-dump line: offset, padded hex bytes, ASCII gutter.
+fn format_hex_row(
+    data: &[u8],
+    base: u64,
+    row: usize,
+    cols: usize,
+    ascii: bool,
+) -> (String, String, String) {
+    let start = row.saturating_mul(cols);
+    let chunk = &data[start.min(data.len())..start.saturating_add(cols).min(data.len())];
+    let offset = format!("{:08X}", base.saturating_add(start as u64));
+    let mut hex = String::with_capacity(cols * 3 + 2);
+    for i in 0..cols {
+        if i > 0 {
+            hex.push(' ');
+        }
+        if cols > 8 && i == cols / 2 {
+            hex.push(' ');
+        }
+        match chunk.get(i) {
+            Some(b) => hex.push_str(&format!("{b:02X}")),
+            None => hex.push_str("  "),
+        }
+    }
+    let gutter = if ascii {
+        chunk
+            .iter()
+            .map(|b| {
+                if b.is_ascii_graphic() || *b == b' ' {
+                    char::from(*b)
+                } else {
+                    '.'
+                }
+            })
+            .collect()
+    } else {
+        String::new()
+    };
+    (offset, hex, gutter)
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -189,9 +294,17 @@ pub struct App {
     nav: Nav,
     probes: Vec<ProbeItem>,
     chips: Vec<ChipItem>,
+    /// Currently attached COM ports, maintained by `spawn_serial_watcher`.
+    ports: Vec<SerialPort>,
+    selected_port: Option<String>,
     chip_search: String,
     chip_details: String,
     firmware: Option<FirmwareInfo>,
+    /// Bytes shown by the hex viewer (decoded image + raw file preview).
+    firmware_view: Option<FirmwareView>,
+    hex_source: HexSource,
+    hex_columns: usize,
+    hex_ascii: bool,
     logs: Vec<LogEntry>,
     show_debug: bool,
     rx: Receiver<Event>,
@@ -303,6 +416,7 @@ impl App {
         let (tx, rx) = channel();
         let watch = Arc::new(WatcherControl::new(s.auto_detect));
         let repaint_ctx = cc.egui_ctx.clone();
+        let serial_repaint_ctx = repaint_ctx.clone();
         let mut app = Self {
             icons: IconSet::load(),
             cfg: s.config,
@@ -314,9 +428,15 @@ impl App {
             nav: Nav::Workbench,
             probes: vec![],
             chips: vec![],
+            ports: vec![],
+            selected_port: None,
             chip_search: s.chip_search,
             chip_details: String::new(),
             firmware: None,
+            firmware_view: None,
+            hex_source: HexSource::Image,
+            hex_columns: 16,
+            hex_ascii: true,
             logs: vec![],
             show_debug: true,
             rx,
@@ -345,9 +465,17 @@ impl App {
         // hot-plug watcher (its first sample is taken immediately).
         backend::spawn_probe_watcher(
             app.tx.clone(),
-            watch,
+            watch.clone(),
             Duration::from_millis(1500),
             move || repaint_ctx.request_repaint(),
+        );
+        // COM ports (including a DAPLink's built-in virtual COM port) are
+        // watched separately: registry/PnP reads never contend with the probe.
+        backend::spawn_serial_watcher(
+            app.tx.clone(),
+            watch,
+            Duration::from_millis(2000),
+            move || serial_repaint_ctx.request_repaint(),
         );
         backend::spawn(Job::LoadChips, app.tx.clone());
         // Restore the previously used firmware if it still exists.
@@ -398,6 +526,16 @@ impl App {
                 }
                 Event::Chips(items) => self.chips = items,
                 Event::ChipDetails(text) => self.chip_details = text,
+                Event::SerialPorts(items) => {
+                    self.ports = items;
+                    if self
+                        .selected_port
+                        .as_deref()
+                        .is_some_and(|name| !self.ports.iter().any(|p| p.name == name))
+                    {
+                        self.selected_port = None;
+                    }
+                }
                 Event::Connected(text) => self.connection = Some(text),
                 Event::Progress { value, label } => {
                     self.progress = value;
@@ -449,6 +587,16 @@ impl App {
         }
     }
 
+    /// Select a probe by its stable identity; enumeration indices change after
+    /// a USB replug, so the id is what gets persisted.
+    fn select_probe(&mut self, i: usize) {
+        if let Some(item) = self.probes.get(i) {
+            self.cfg.probe_index = i;
+            self.cfg.probe_id = Some(item.id.clone());
+            self.connection = None;
+        }
+    }
+
     fn probe_ready(&self) -> bool {
         self.cfg
             .probe_id
@@ -458,14 +606,6 @@ impl App {
 
     fn can_run(&self) -> bool {
         !self.busy && self.probe_ready()
-    }
-
-    fn select_probe(&mut self, i: usize) {
-        if let Some(item) = self.probes.get(i) {
-            self.cfg.probe_index = i;
-            self.cfg.probe_id = Some(item.id.clone());
-            self.connection = None;
-        }
     }
 
     fn snapshot(&self) -> Settings {
@@ -569,17 +709,32 @@ impl App {
         let format = FirmwareFormat::from_path(&path).unwrap_or(self.cfg.format);
         self.cfg.format = format;
         self.cfg.firmware = Some(path.clone());
+        // The hex viewer shows raw bytes even when parsing fails (an ELF, a
+        // malformed HEX, or an unknown extension is still worth inspecting).
+        let raw = read_file_preview(&path);
         match firmware::inspect(&path, format, self.cfg.bin_base) {
             Ok(info) => {
                 self.push_log(
                     Level::Ok,
                     format!("固件已载入: {} ({} 字节)", path.display(), info.size),
                 );
+                self.firmware_view = Some(FirmwareView {
+                    raw: Arc::from(raw.as_slice()),
+                    image: info.image.as_deref().map(Arc::from),
+                    image_base: info.image_base.unwrap_or(0),
+                });
                 self.firmware = Some(info);
             }
             Err(e) => {
                 self.push_log(Level::Error, format!("解析固件失败: {e:#}"));
+                self.firmware_view = Some(FirmwareView {
+                    raw: Arc::from(raw.as_slice()),
+                    image: None,
+                    image_base: 0,
+                });
                 self.firmware = None;
+                // A file without a decodable image is best shown as raw bytes.
+                self.hex_source = HexSource::File;
             }
         }
         self.recent.retain(|p| p != &path);
@@ -690,7 +845,7 @@ impl App {
                 ui.vertical_centered(|ui| {
                     let items: [(Nav, IconKind, &str); 5] = [
                         (Nav::Workbench, IconKind::Workbench, "工作台"),
-                        (Nav::Devices, IconKind::Devices, "设备 / 调试探针"),
+                        (Nav::Serial, IconKind::Serial, "串口识别 / 虚拟串口"),
                         (Nav::Chips, IconKind::Chips, "芯片库"),
                         (Nav::Logs, IconKind::Logs, "运行日志"),
                         (Nav::Settings, IconKind::Settings, "设置"),
@@ -733,47 +888,310 @@ impl App {
             .frame(Frame::new().fill(p.sidebar).inner_margin(14.0))
             .show(root, |ui| match self.nav {
                 Nav::Workbench => self.sidebar_workbench(ui, p),
-                Nav::Devices => self.sidebar_devices(ui, p),
+                Nav::Serial => self.sidebar_serial(ui, p),
                 Nav::Chips => self.sidebar_chips(ui, p),
                 Nav::Logs => self.sidebar_logs(ui, p),
                 Nav::Settings => self.sidebar_settings(ui, p),
             });
     }
 
+    /// The narrow "current session" rail owns every control: connection,
+    /// firmware, flashing options and actions. The centre pane is reserved
+    /// for the hex viewer, so it must stay scrollable on short windows.
     fn sidebar_workbench(&mut self, ui: &mut Ui, p: Palette) {
-        ui.label(RichText::new("当前会话").size(13.0).strong().color(p.text));
-        ui.add_space(10.0);
-        Frame::new()
-            .fill(p.card)
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(10.0)
-            .inner_margin(12.0)
-            .show(ui, |ui| {
-                ui.label(RichText::new("调试链路").size(11.0).color(p.text3));
-                ui.add_space(6.0);
-                let probe = self
-                    .probes
-                    .get(self.cfg.probe_index)
-                    .map(|x| x.label.as_str())
-                    .unwrap_or("尚未检测到探针");
-                ui.label(RichText::new(probe).size(12.0).color(p.text));
-                ui.label(
-                    RichText::new(format!("{} · {} · {} kHz", self.cfg.chip, proto_label(self.cfg.protocol), self.cfg.speed_khz))
-                        .size(11.0)
-                        .color(p.text2),
-                );
-                ui.add_space(6.0);
-                let (ok, color) = match &self.connection {
-                    Some(_) => ("已连接", p.success),
-                    None => ("未连接", p.text3),
-                };
-                ui.label(RichText::new(format!("● {ok}")).size(11.0).color(color));
+        let (state, color) = match &self.connection {
+            Some(_) => ("已连接", p.success),
+            None => ("未连接", p.text3),
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("当前会话").size(13.0).strong().color(p.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new(format!("● {state}")).size(10.0).color(color));
             });
-        ui.add_space(16.0);
-        ui.label(RichText::new("最近固件").size(13.0).strong().color(p.text));
+        });
         ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.session_connection(ui, p);
+                ui.add_space(14.0);
+                self.session_firmware(ui, p);
+                ui.add_space(14.0);
+                self.session_actions(ui, p);
+                ui.add_space(14.0);
+                self.session_recents(ui, p);
+            });
+    }
+
+    fn session_connection(&mut self, ui: &mut Ui, p: Palette) {
+        Self::section_title(ui, p, "连接配置");
+        ui.add_space(6.0);
+        ui.label(RichText::new("调试探针").size(10.0).color(p.text3));
+        let selected = self
+            .cfg
+            .probe_id
+            .as_deref()
+            .and_then(|id| self.probes.iter().find(|x| x.id == id))
+            .map(|x| x.label.clone())
+            .unwrap_or_else(|| {
+                if self.probes.is_empty() {
+                    "未检测到探针".to_owned()
+                } else {
+                    "所选探针已断开，请重新选择".to_owned()
+                }
+            });
+        let w = ui.available_width();
+        egui::ComboBox::from_id_salt("sidebar_probe_combo")
+            .selected_text(RichText::new(selected).size(10.5).color(p.text))
+            .width(w)
+            .show_ui(ui, |ui| {
+                if self.probes.is_empty() {
+                    ui.label(RichText::new("请插入调试器").size(10.0).color(p.text3));
+                }
+                for (i, item) in self.probes.clone().iter().enumerate() {
+                    let chosen = self.cfg.probe_id.as_deref() == Some(item.id.as_str());
+                    if ui
+                        .selectable_label(chosen, item.label.as_str())
+                        .on_hover_text(item.detail.as_str())
+                        .clicked()
+                    {
+                        self.select_probe(i);
+                    }
+                }
+            });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("协议").size(10.0).color(p.text3));
+            egui::ComboBox::from_id_salt("sidebar_proto_combo")
+                .selected_text(proto_label(self.cfg.protocol))
+                .width(66.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.cfg.protocol, Protocol::Swd, "SWD");
+                    ui.selectable_value(&mut self.cfg.protocol, Protocol::Jtag, "JTAG");
+                });
+            ui.label(RichText::new("kHz").size(10.0).color(p.text3));
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::TextEdit::singleline(&mut self.speed_text),
+            );
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new("目标芯片").size(10.0).color(p.text3));
+        let w = ui.available_width();
+        ui.add_sized(
+            [w, 24.0],
+            egui::TextEdit::singleline(&mut self.cfg.chip).hint_text("如 PY32F003x8"),
+        );
+        if !self.recent_chips.is_empty() {
+            ui.add_space(6.0);
+            let recent = self.recent_chips.clone();
+            let mut picked: Option<String> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("最近").size(9.0).color(p.text3));
+                for name in &recent {
+                    let active = self.cfg.chip.eq_ignore_ascii_case(name);
+                    let btn = egui::Button::new(
+                        RichText::new(name)
+                            .size(9.0)
+                            .color(if active { p.accent } else { p.text2 }),
+                    )
+                    .fill(if active { p.accent_soft } else { p.card_alt });
+                    if ui.add(btn).clicked() {
+                        picked = Some(name.clone());
+                    }
+                }
+            });
+            if let Some(name) = picked {
+                self.select_chip(&name, false);
+            }
+        }
+        ui.add_space(8.0);
+        ui.checkbox(&mut self.cfg.connect_under_reset, "复位下连接");
+        ui.add_space(6.0);
+        let half = (ui.available_width() - 6.0) / 2.0;
+        ui.horizontal(|ui| {
+            if Self::sidebar_button(ui, p, "连接测试", self.can_run(), false, half).clicked() {
+                self.start_job(Job::Connect(Box::new(self.cfg.clone())), "连接测试");
+            }
+            if Self::sidebar_button(ui, p, "芯片详情", !self.busy, false, half).clicked() {
+                let chip = self.cfg.chip.clone();
+                self.remember_chip(&chip);
+                backend::spawn(
+                    Job::ChipInfo {
+                        chip,
+                        cfg: Box::new(self.cfg.clone()),
+                    },
+                    self.tx.clone(),
+                );
+            }
+        });
+        if !self.chip_details.is_empty() {
+            let details = self.chip_details.clone();
+            egui::CollapsingHeader::new(RichText::new("芯片描述").size(10.0).color(p.text3))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for line in details.lines() {
+                        ui.label(RichText::new(line).monospace().size(9.0).color(p.text2));
+                    }
+                });
+        }
+    }
+
+    fn session_firmware(&mut self, ui: &mut Ui, p: Palette) {
+        Self::section_title(ui, p, "固件文件");
+        ui.add_space(6.0);
+        let w = ui.available_width();
+        let mut picked: Option<PathBuf> = None;
+        if Self::sidebar_button(ui, p, "浏览… / 拖入固件", true, false, w).clicked() {
+            picked = with_all_files(rfd::FileDialog::new())
+                .add_filter("固件", &["hex", "ihex", "elf", "axf", "out", "bin"])
+                .pick_file();
+        }
+        if let Some(path) = picked {
+            self.set_firmware(path);
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("格式").size(10.0).color(p.text3));
+        let before = self.cfg.format;
+        egui::ComboBox::from_id_salt("sidebar_format_combo")
+            .selected_text(self.cfg.format.label())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for f in [FirmwareFormat::Hex, FirmwareFormat::Elf, FirmwareFormat::Bin] {
+                    ui.selectable_value(&mut self.cfg.format, f, f.label());
+                }
+            });
+        if self.cfg.format != before {
+            if let Some(path) = self.cfg.firmware.clone() {
+                self.set_firmware(path);
+            }
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("BIN 基址").size(10.0).color(p.text3));
+            ui.add_sized(
+                [ui.available_width(), 24.0],
+                egui::TextEdit::singleline(&mut self.bin_base_text),
+            );
+        });
+        if let Some(path) = self.cfg.firmware.clone() {
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            ui.add_space(6.0);
+            ui.label(RichText::new(name).size(10.0).color(p.text))
+                .on_hover_text(path.display().to_string());
+        }
+        if let Some(info) = self.firmware.clone() {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} · {} 字节 · {} 条记录",
+                    info.format.label(),
+                    info.size,
+                    info.records
+                ))
+                .size(9.0)
+                .color(p.text2),
+            );
+            ui.label(
+                RichText::new(format!("SHA256 {}", &info.sha256[..16]))
+                    .monospace()
+                    .size(9.0)
+                    .color(p.text3),
+            );
+            if !self.firmware_view.as_ref().is_some_and(|v| v.image.is_some()) {
+                ui.label(
+                    RichText::new("无解码镜像 · 右侧显示文件原始字节")
+                        .size(9.0)
+                        .color(p.warn),
+                );
+            }
+        }
+    }
+
+    fn session_actions(&mut self, ui: &mut Ui, p: Palette) {
+        Self::section_title(ui, p, "烧录选项与操作");
+        ui.add_space(6.0);
+        ui.checkbox(&mut self.cfg.verify, "写入后校验");
+        ui.checkbox(&mut self.cfg.restore_unwritten, "保留未写入字节");
+        ui.checkbox(&mut self.cfg.verify_readback, "独立读回比对");
+        ui.checkbox(&mut self.cfg.reset_after, "完成后复位运行");
+        ui.checkbox(&mut self.cfg.preverify, "预校验跳过相同区域");
+        ui.checkbox(&mut self.cfg.chip_erase, "整片擦除");
+        ui.add_space(8.0);
+        let full = ui.available_width();
+        if Self::sidebar_button(ui, p, "开始烧录", self.can_run() && self.firmware.is_some(), true, full)
+            .clicked()
+        {
+            self.start_job(Job::Flash(Box::new(self.cfg.clone())), "烧录固件");
+        }
+        ui.add_space(6.0);
+        let half = (ui.available_width() - 6.0) / 2.0;
+        ui.horizontal(|ui| {
+            if Self::sidebar_button(ui, p, "独立校验", self.can_run() && self.firmware.is_some(), false, half).clicked() {
+                self.start_job(Job::VerifyFirmware(Box::new(self.cfg.clone())), "读回校验");
+            }
+            if Self::sidebar_button(ui, p, "读回备份", self.can_run(), false, half).clicked() {
+                self.start_job(Job::ReadBack(Box::new(self.cfg.clone())), "读回备份");
+            }
+        });
+        ui.horizontal(|ui| {
+            if Self::sidebar_button(ui, p, "复位运行", self.can_run(), false, half).clicked() {
+                self.start_job(Job::Reset(Box::new(self.cfg.clone())), "复位目标");
+            }
+            let erase_text = if self.erase_armed { "确认擦除？" } else { "整片擦除" };
+            if Self::sidebar_button(ui, p, erase_text, self.can_run(), false, half).clicked() {
+                if self.erase_armed {
+                    self.erase_armed = false;
+                    self.start_job(Job::EraseAll(Box::new(self.cfg.clone())), "整片擦除");
+                } else {
+                    self.erase_armed = true;
+                    self.push_log(Level::Warn, "整片擦除需二次点击确认，会清除芯片全部 Flash");
+                }
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("读回地址").size(9.0).color(p.text3));
+            ui.add_sized(
+                [ui.available_width(), 22.0],
+                egui::TextEdit::singleline(&mut self.addr_text),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("长度 (字节)").size(9.0).color(p.text3));
+            ui.add_sized(
+                [ui.available_width(), 22.0],
+                egui::TextEdit::singleline(&mut self.size_text),
+            );
+        });
+        ui.horizontal(|ui| {
+            let path = self.cfg.backup_path.display().to_string();
+            ui.label(RichText::new(path).size(9.0).color(p.text3))
+                .on_hover_text(self.cfg.backup_path.display().to_string());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("更改…").clicked() {
+                    if let Some(path) = with_all_files(
+                        rfd::FileDialog::new().add_filter("二进制", &["bin"]),
+                    )
+                    .set_file_name("backup_before.bin")
+                    .save_file()
+                    {
+                        self.cfg.backup_path = path;
+                    }
+                }
+            });
+        });
+    }
+
+    fn session_recents(&mut self, ui: &mut Ui, p: Palette) {
+        Self::section_title(ui, p, "最近固件");
+        ui.add_space(6.0);
         if self.recent.is_empty() {
-            ui.label(RichText::new("暂无记录").size(11.0).color(p.text3));
+            ui.label(RichText::new("暂无记录").size(10.0).color(p.text3));
         }
         let recent = self.recent.clone();
         for path in recent {
@@ -782,88 +1200,162 @@ impl App {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
             if ui
-                .add(egui::Button::new(RichText::new(name).color(p.text2)).fill(Color32::TRANSPARENT))
+                .add(egui::Button::new(RichText::new(name).size(10.0).color(p.text2)).fill(Color32::TRANSPARENT))
                 .on_hover_text(path.display().to_string())
                 .clicked()
             {
                 self.set_firmware(path);
             }
         }
-        ui.add_space(18.0);
-        ui.label(RichText::new("快捷操作").size(13.0).strong().color(p.text));
-        ui.add_space(8.0);
-        if ui.button("刷新探针").clicked() {
-            self.start_job(Job::RefreshProbes, "刷新探针");
-        }
-        if ui.button("查看日志").clicked() {
-            self.nav = Nav::Logs;
-        }
+        ui.add_space(12.0);
+        Self::section_title(ui, p, "快捷操作");
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("刷新探针").clicked() {
+                self.start_job(Job::RefreshProbes, "刷新探针");
+            }
+            if ui.button("查看日志").clicked() {
+                self.nav = Nav::Logs;
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("运行日志固定在底部，可拖拽上边缘调整高度")
+                .size(9.0)
+                .color(p.text3),
+        );
     }
 
-    fn sidebar_devices(&mut self, ui: &mut Ui, p: Palette) {
+    fn section_title(ui: &mut Ui, p: Palette, text: &str) {
+        ui.label(RichText::new(text).size(11.0).strong().color(p.text2));
+    }
+
+    fn sidebar_button(
+        ui: &mut Ui,
+        p: Palette,
+        text: &str,
+        enabled: bool,
+        primary: bool,
+        width: f32,
+    ) -> egui::Response {
+        let btn = egui::Button::new(
+            RichText::new(text)
+                .size(11.0)
+                .color(if primary { Color32::WHITE } else { p.text2 }),
+        )
+        .fill(if enabled && primary { p.accent } else { p.card_alt })
+        .stroke(if primary {
+            Stroke::NONE
+        } else {
+            Stroke::new(1.0, p.border)
+        })
+        .min_size(Vec2::new(width, 28.0));
+        ui.add_enabled(enabled, btn)
+    }
+
+    fn sidebar_serial(&mut self, ui: &mut Ui, p: Palette) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("调试探针").size(13.0).strong().color(p.text));
+            ui.label(RichText::new("串口识别").size(13.0).strong().color(p.text));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("刷新").clicked() {
-                    self.start_job(Job::RefreshProbes, "刷新探针");
+                    self.ports = serial::enumerate();
+                    self.push_log(
+                        Level::Info,
+                        format!("已刷新串口列表 · 当前在线 {} 个", self.ports.len()),
+                    );
                 }
             });
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let (dot, _) = ui.allocate_exact_size(Vec2::new(9.0, 9.0), Sense::hover());
-            ui.painter().circle_filled(
-                dot.center(),
-                3.5,
-                if self.auto_detect { p.success } else { p.text3 },
-            );
+            ui.painter().circle_filled(dot.center(), 3.5, p.success);
             ui.label(
-                RichText::new(if self.auto_detect {
-                    "自动检测中 · 插入/拔出自动刷新 (1.5s)"
-                } else {
-                    "自动检测已关闭 · 请手动刷新"
-                })
-                .size(10.0)
-                .color(p.text3),
+                RichText::new("自动检测中 · 插入/拔出自动刷新 (2s)")
+                    .size(10.0)
+                    .color(p.text3),
             );
         });
-        if let Some(t) = &self.last_hotplug {
-            ui.label(RichText::new(format!("上次变化 {t}")).size(10.0).color(p.text3));
-        }
+        ui.add_space(4.0);
+        let vcp = self.ports.iter().filter(|x| x.is_debug_vcp()).count();
+        ui.label(
+            RichText::new(format!("在线 {} 个 · 调试器虚拟串口 {vcp} 个", self.ports.len()))
+                .size(10.0)
+                .color(p.text3),
+        );
         ui.add_space(10.0);
-        if self.probes.is_empty() {
-            ui.label(RichText::new("未发现探针，请检查 USB 连接").size(11.0).color(p.text3));
-        } else if !self.probe_ready() {
-            ui.label(
-                RichText::new("所选探针已断开，请在下方重新选择")
-                    .size(11.0)
-                    .color(p.warn),
-            );
+        if self.ports.is_empty() {
+            ui.label(RichText::new("未发现串口，请检查 USB 连接").size(11.0).color(p.text3));
         }
-        let probes = self.probes.clone();
-        for (i, item) in probes.iter().enumerate() {
-            let selected = self.cfg.probe_id.as_deref() == Some(item.id.as_str());
+        let ports = self.ports.clone();
+        for item in &ports {
+            let selected = self.selected_port.as_deref() == Some(item.name.as_str());
+            let highlight = item.is_debug_vcp();
             Frame::new()
                 .fill(if selected { p.accent_soft } else { p.card })
-                .stroke(Stroke::new(1.0, if selected { p.accent } else { p.border }))
+                .stroke(Stroke::new(
+                    1.0,
+                    if selected {
+                        p.accent
+                    } else if highlight {
+                        p.accent
+                    } else {
+                        p.border
+                    },
+                ))
                 .corner_radius(9.0)
                 .inner_margin(10.0)
                 .show(ui, |ui| {
                     if ui
-                        .add(egui::Button::new(RichText::new(&item.label).color(p.text).size(12.0)).fill(Color32::TRANSPARENT))
+                        .add(
+                            egui::Button::new(
+                                RichText::new(item.name.as_str())
+                                    .size(12.0)
+                                    .strong()
+                                    .color(if highlight { p.accent } else { p.text }),
+                            )
+                            .fill(Color32::TRANSPARENT),
+                        )
                         .clicked()
                     {
-                        self.select_probe(i);
+                        self.selected_port = Some(item.name.clone());
                     }
-                    ui.label(RichText::new(&item.detail).size(10.0).color(p.text3));
+                    ui.label(
+                        RichText::new(item.kind.label())
+                            .size(10.0)
+                            .color(if highlight { p.accent } else { p.text3 }),
+                    );
+                    ui.label(
+                        RichText::new(item.description.as_str())
+                            .size(9.0)
+                            .color(p.text3),
+                    );
+                    ui.label(
+                        RichText::new(if item.openable {
+                            "● 可打开"
+                        } else {
+                            "● 被占用 / 不可用"
+                        })
+                        .size(9.0)
+                        .color(if item.openable { p.success } else { p.warn }),
+                    );
                 });
             ui.add_space(6.0);
         }
         ui.add_space(16.0);
-        ui.label(RichText::new("故障提示").size(12.0).strong().color(p.text));
+        ui.label(RichText::new("关于虚拟串口").size(12.0).strong().color(p.text));
         ui.label(
-            RichText::new("若所有 DAP 命令超时，多为调试器固件卡死：物理拔插 USB 后重试。")
-                .size(11.0)
+            RichText::new(
+                "DAPLink / CMSIS-DAP 常把 CDC 虚拟串口与调试接口做在同一个 USB 设备上；\
+                 这里按 VID/PID 与设备描述自动标注，并可与当前探针关联。",
+            )
+            .size(10.0)
+            .color(p.text3),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("调试探针仍在工作台的连接配置中选择，不再单独占一个页面。")
+                .size(10.0)
                 .color(p.text3),
         );
     }
@@ -1029,7 +1521,7 @@ impl App {
         });
         ui.add_space(12.0);
         ui.label(RichText::new("设备检测").size(11.0).color(p.text3));
-        ui.checkbox(&mut self.auto_detect, "自动检测调试探针插入 / 拔出");
+        ui.checkbox(&mut self.auto_detect, "自动检测调试探针 / 串口插入拔出");
         ui.label(
             RichText::new("每 1.5 秒检查一次；烧录期间自动暂停，避免占用 USB。")
                 .size(10.0)
@@ -1346,310 +1838,219 @@ impl App {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(20, 16)))
             .show(root, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(
-                            RichText::new("连接与烧录")
-                                .size(22.0)
-                                .strong()
-                                .color(p.text),
-                        );
-                        ui.label(
-                            RichText::new("选择探针与目标芯片，载入固件，然后一键写入并校验")
-                                .size(12.0)
-                                .color(p.text3),
-                        );
-                        ui.add_space(16.0);
+                if self.nav == Nav::Serial {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            self.draw_serial_center(ui, p);
+                        });
+                } else {
+                    self.draw_hex_viewer(ui, p);
+                }
+            });
+    }
 
-                        // --- Connection card ---
-                        Self::card(ui, p, "连接配置", |ui| {
-                            egui::Grid::new("conn_grid")
-                                .num_columns(4)
-                                .spacing([12.0, 10.0])
-                                .show(ui, |ui| {
-                                    ui.label(RichText::new("调试探针").size(11.0).color(p.text3));
-                                    let selected = self
-                                        .cfg
-                                        .probe_id
-                                        .as_deref()
-                                        .and_then(|id| self.probes.iter().find(|x| x.id == id))
-                                        .map(|x| x.label.clone())
-                                        .unwrap_or_else(|| {
-                                            if self.probes.is_empty() {
-                                                "未检测到探针".to_owned()
-                                            } else {
-                                                "所选探针已断开，请重新选择".to_owned()
-                                            }
-                                        });
-                                    egui::ComboBox::from_id_salt("probe_combo")
-                                        .selected_text(RichText::new(selected).color(p.text))
-                                        .width(260.0)
-                                        .show_ui(ui, |ui| {
-                                            for (i, item) in self.probes.clone().iter().enumerate() {
-                                                let prev = self.cfg.probe_index;
-                                                ui.selectable_value(
-                                                    &mut self.cfg.probe_index,
-                                                    i,
-                                                    item.label.clone(),
-                                                );
-                                                if self.cfg.probe_index != prev
-                                                    && self.cfg.probe_index == i
-                                                {
-                                                    self.cfg.probe_id = Some(item.id.clone());
-                                                    self.connection = None;
-                                                }
-                                            }
-                                        });
-                                    ui.label(RichText::new("协议").size(11.0).color(p.text3));
-                                    egui::ComboBox::from_id_salt("proto_combo")
-                                        .selected_text(proto_label(self.cfg.protocol))
-                                        .width(90.0)
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(&mut self.cfg.protocol, Protocol::Swd, "SWD");
-                                            ui.selectable_value(&mut self.cfg.protocol, Protocol::Jtag, "JTAG");
-                                        });
-                                    ui.end_row();
+    /// The session pane: a virtualised hex dump of the loaded firmware. All
+    /// settings and actions live in the narrow "当前会话" sidebar.
+    fn draw_hex_viewer(&mut self, ui: &mut Ui, p: Palette) {
+        let mut picked: Option<PathBuf> = None;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("固件 16 进制查看器")
+                    .size(21.0)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if Self::ghost_button(ui, p, "浏览…", true).clicked() {
+                    picked = with_all_files(rfd::FileDialog::new())
+                        .add_filter("固件", &["hex", "ihex", "elf", "axf", "out", "bin"])
+                        .pick_file();
+                }
+            });
+        });
+        if let Some(path) = picked {
+            self.set_firmware(path);
+        }
+        ui.label(
+            RichText::new("左侧「当前会话」完成连接与烧录；这里显示已载入固件的字节，可拖入文件直接查看")
+                .size(11.0)
+                .color(p.text3),
+        );
+        ui.add_space(10.0);
 
-                                    ui.label(RichText::new("目标芯片").size(11.0).color(p.text3));
-                                    ui.add_sized(
-                                        [260.0, 26.0],
-                                        egui::TextEdit::singleline(&mut self.cfg.chip)
-                                            .hint_text("如 PY32F003x8"),
-                                    );
-                                    ui.label(RichText::new("速度 (kHz)").size(11.0).color(p.text3));
-                                    ui.add_sized(
-                                        [90.0, 26.0],
-                                        egui::TextEdit::singleline(&mut self.speed_text),
-                                    );
-                                    ui.end_row();
-                                });
-                            if !self.recent_chips.is_empty() {
-                                ui.add_space(6.0);
-                                let recent = self.recent_chips.clone();
-                                let mut picked: Option<String> = None;
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(RichText::new("最近型号").size(10.0).color(p.text3));
-                                    for name in &recent {
-                                        let active = self.cfg.chip.eq_ignore_ascii_case(name);
-                                        let btn = egui::Button::new(
-                                            RichText::new(name)
-                                                .size(10.0)
-                                                .color(if active { p.accent } else { p.text2 }),
-                                        )
-                                        .fill(if active { p.accent_soft } else { p.card_alt });
-                                        if ui.add(btn).clicked() {
-                                            picked = Some(name.clone());
-                                        }
-                                    }
-                                });
-                                if let Some(name) = picked {
-                                    self.select_chip(&name, false);
-                                }
-                            }
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut self.cfg.connect_under_reset, "复位下连接");
-                                ui.add_space(12.0);
-                                if Self::ghost_button(ui, p, "连接测试", self.can_run()).clicked() {
-                                    self.start_job(Job::Connect(Box::new(self.cfg.clone())), "连接测试");
-                                }
-                                if Self::ghost_button(ui, p, "芯片详情", !self.busy).clicked() {
-                                    let chip = self.cfg.chip.clone();
-                                    self.remember_chip(&chip);
-                                    backend::spawn(
-                                        Job::ChipInfo {
-                                            chip,
-                                            cfg: Box::new(self.cfg.clone()),
-                                        },
-                                        self.tx.clone(),
-                                    );
-                                    self.nav = Nav::Chips;
-                                }
-                                if !self.chip_details.is_empty() {
-                                    ui.label(RichText::new("已读取描述").size(10.0).color(p.success));
-                                }
-                            });
-                            if !self.chip_details.is_empty() {
-                                ui.add_space(10.0);
-                                Frame::new()
-                                    .fill(p.card_alt)
-                                    .corner_radius(8.0)
-                                    .inner_margin(10.0)
-                                    .show(ui, |ui| {
-                                        for line in self.chip_details.lines() {
-                                            ui.label(
-                                                RichText::new(line).monospace().size(10.5).color(p.text2),
-                                            );
-                                        }
-                                    });
+        let file_name = self
+            .cfg
+            .firmware
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "尚未载入固件".to_owned());
+        let summary = self
+            .firmware
+            .as_ref()
+            .map(|i| {
+                format!(
+                    "{} · {} 字节 · {} 条记录 · {}",
+                    i.format.label(),
+                    i.size,
+                    i.records,
+                    i.note
+                )
+            })
+            .unwrap_or_default();
+        let sha = self
+            .firmware
+            .as_ref()
+            .map(|i| i.sha256.clone())
+            .unwrap_or_default();
+        let view = self.firmware_view.clone();
+        let (bytes, base, label) = resolve_hex_view(view.as_ref(), self.hex_source);
+        let rows = bytes.len().saturating_add(self.hex_columns - 1) / self.hex_columns;
+        let capped = view.as_ref().is_some_and(|v| v.raw.len() >= HEX_VIEW_LIMIT);
+
+        Frame::new()
+            .fill(p.card)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(12.0)
+            .inner_margin(14.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(&file_name).size(12.0).strong().color(p.text));
+                if !summary.is_empty() {
+                    ui.label(RichText::new(&summary).size(10.0).color(p.text2));
+                }
+                if !sha.is_empty() {
+                    ui.label(
+                        RichText::new(format!("SHA256  {sha}"))
+                            .monospace()
+                            .size(9.5)
+                            .color(p.text3),
+                    );
+                }
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("数据源").size(10.0).color(p.text3));
+                    egui::ComboBox::from_id_salt("hex_source_combo")
+                        .selected_text(self.hex_source.label())
+                        .width(132.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.hex_source, HexSource::Image, "固件镜像");
+                            ui.selectable_value(
+                                &mut self.hex_source,
+                                HexSource::File,
+                                "文件原始字节",
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("每行字节").size(10.0).color(p.text3));
+                    egui::ComboBox::from_id_salt("hex_columns_combo")
+                        .selected_text(self.hex_columns.to_string())
+                        .width(58.0)
+                        .show_ui(ui, |ui| {
+                            for n in [8usize, 16, 32] {
+                                ui.selectable_value(&mut self.hex_columns, n, n.to_string());
                             }
                         });
-                        ui.add_space(14.0);
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut self.hex_ascii, "ASCII 栏");
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("{label} · 基址 0x{base:08X} · {rows} 行"))
+                            .size(10.0)
+                            .color(p.accent),
+                    );
+                });
+            });
+        ui.add_space(10.0);
 
-                        // --- Firmware card ---
-                        Self::card(ui, p, "固件文件", |ui| {
-                            let (_, drop_rect) =
-                                ui.allocate_space(Vec2::new(ui.available_width(), 64.0));
-                            ui.painter().rect_filled(
-                                drop_rect,
-                                CornerRadius::same(10),
-                                p.card_alt,
-                            );
-                            let text = self
-                                .cfg
-                                .firmware
-                                .as_ref()
-                                .map(|x| x.display().to_string())
-                                .unwrap_or_else(|| "拖拽 .hex / .elf / .bin 到此处，或点击「浏览」".to_owned());
-                            ui.painter().text(
-                                drop_rect.center(),
-                                Align2::CENTER_CENTER,
-                                text,
-                                FontId::proportional(12.0),
-                                p.text2,
-                            );
-                            ui.add_space(10.0);
+        if bytes.is_empty() {
+            Frame::new()
+                .fill(p.card_alt)
+                .stroke(Stroke::new(1.0, p.border))
+                .corner_radius(12.0)
+                .inner_margin(20.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let (_, rect) = ui.allocate_space(Vec2::new(ui.available_width(), 140.0));
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "拖拽 .hex / .elf / .bin 到窗口，或点击「浏览…」载入固件",
+                        FontId::proportional(13.0),
+                        p.text3,
+                    );
+                });
+            return;
+        }
+
+        let cols = self.hex_columns;
+        let ascii = self.hex_ascii;
+        Frame::new()
+            .fill(p.console)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                // Same widget structure as the rows, so the labels line up
+                // with the offset / hex / ASCII columns for every row width.
+                let hex_width = cols * 3 - 1 + usize::from(cols > 8);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("{:<8}", "OFFSET"))
+                            .monospace()
+                            .size(11.0)
+                            .color(p.text3),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(format!("{:<hex_width$}", "HEX BYTES"))
+                            .monospace()
+                            .size(11.0)
+                            .color(p.text3),
+                    );
+                    if ascii {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("ASCII").monospace().size(11.0).color(p.text3));
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, 19.0, rows, |ui, range| {
+                        for row in range {
+                            let (offset, hex, gutter) = format_hex_row(bytes, base, row, cols, ascii);
                             ui.horizontal(|ui| {
-                                if Self::ghost_button(ui, p, "浏览…", true).clicked() {
-                                    if let Some(path) = with_all_files(rfd::FileDialog::new())
-                                        .add_filter("固件", &["hex", "ihex", "elf", "axf", "out", "bin"])
-                                        .pick_file()
-                                    {
-                                        self.set_firmware(path);
-                                    }
-                                }
-                                ui.label(RichText::new("格式").size(11.0).color(p.text3));
-                                let before = self.cfg.format;
-                                egui::ComboBox::from_id_salt("format_combo")
-                                    .selected_text(self.cfg.format.label())
-                                    .width(120.0)
-                                    .show_ui(ui, |ui| {
-                                        for f in [FirmwareFormat::Hex, FirmwareFormat::Elf, FirmwareFormat::Bin] {
-                                            ui.selectable_value(&mut self.cfg.format, f, f.label());
-                                        }
-                                    });
-                                if self.cfg.format != before {
-                                    if let Some(path) = self.cfg.firmware.clone() {
-                                        self.set_firmware(path);
-                                    }
-                                }
-                                ui.add_space(8.0);
-                                ui.label(RichText::new("BIN 基址").size(11.0).color(p.text3));
-                                ui.add_sized(
-                                    [110.0, 26.0],
-                                    egui::TextEdit::singleline(&mut self.bin_base_text),
-                                );
-                            });
-                            if let Some(info) = &self.firmware {
+                                ui.label(RichText::new(offset).monospace().size(11.0).color(p.text3));
                                 ui.add_space(10.0);
-                                Frame::new()
-                                    .fill(p.card_alt)
-                                    .corner_radius(8.0)
-                                    .inner_margin(10.0)
-                                    .show(ui, |ui| {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{} · {} 字节 · {} 条记录",
-                                                info.format.label(),
-                                                info.size,
-                                                info.records
-                                            ))
+                                ui.label(RichText::new(hex).monospace().size(11.0).color(p.text));
+                                if ascii {
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        RichText::new(gutter)
                                             .monospace()
                                             .size(11.0)
                                             .color(p.text2),
-                                        );
-                                        ui.label(
-                                            RichText::new(&info.note).monospace().size(10.5).color(p.text3),
-                                        );
-                                        ui.label(
-                                            RichText::new(format!("SHA256  {}", info.sha256))
-                                                .monospace()
-                                                .size(10.0)
-                                                .color(p.text3),
-                                        );
-                                    });
-                            }
-                        });
-                        ui.add_space(14.0);
-
-                        // --- Options + actions card ---
-                        Self::card(ui, p, "烧录选项与操作", |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.checkbox(&mut self.cfg.verify, "写入后校验");
-                                ui.checkbox(&mut self.cfg.restore_unwritten, "保留未写入字节");
-                                ui.checkbox(&mut self.cfg.verify_readback, "独立读回比对");
-                                ui.checkbox(&mut self.cfg.reset_after, "完成后复位运行");
-                                ui.checkbox(&mut self.cfg.preverify, "预校验跳过相同区域");
-                                ui.checkbox(&mut self.cfg.chip_erase, "整片擦除");
-                            });
-                            ui.add_space(12.0);
-                            ui.horizontal_wrapped(|ui| {
-                                if Self::primary_button(ui, p, "开始烧录", self.can_run() && self.firmware.is_some()).clicked()
-                                {
-                                    self.start_job(Job::Flash(Box::new(self.cfg.clone())), "烧录固件");
-                                }
-                                if Self::ghost_button(ui, p, "独立校验", self.can_run() && self.firmware.is_some()).clicked()
-                                {
-                                    self.start_job(
-                                        Job::VerifyFirmware(Box::new(self.cfg.clone())),
-                                        "读回校验",
                                     );
                                 }
-                                if Self::ghost_button(ui, p, "读回备份", self.can_run()).clicked() {
-                                    self.start_job(Job::ReadBack(Box::new(self.cfg.clone())), "读回备份");
-                                }
-                                if Self::ghost_button(ui, p, "复位运行", self.can_run()).clicked() {
-                                    self.start_job(Job::Reset(Box::new(self.cfg.clone())), "复位目标");
-                                }
-                                let erase_text = if self.erase_armed { "确认擦除？" } else { "整片擦除" };
-                                if Self::ghost_button(ui, p, erase_text, self.can_run()).clicked() {
-                                    if self.erase_armed {
-                                        self.erase_armed = false;
-                                        self.start_job(Job::EraseAll(Box::new(self.cfg.clone())), "整片擦除");
-                                    } else {
-                                        self.erase_armed = true;
-                                        self.push_log(Level::Warn, "整片擦除需二次点击确认，会清除芯片全部 Flash");
-                                    }
-                                }
                             });
-                            ui.add_space(12.0);
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("读回地址").size(11.0).color(p.text3));
-                                ui.add_sized([110.0, 26.0], egui::TextEdit::singleline(&mut self.addr_text));
-                                ui.add_space(10.0);
-                                ui.label(RichText::new("长度 (字节)").size(11.0).color(p.text3));
-                                ui.add_sized([90.0, 26.0], egui::TextEdit::singleline(&mut self.size_text));
-                                ui.add_space(10.0);
-                                ui.label(
-                                    RichText::new(format!("→ {}", self.cfg.backup_path.display()))
-                                        .size(10.0)
-                                        .color(p.text3),
-                                );
-                                if ui.button("更改…").clicked() {
-                                    if let Some(path) = with_all_files(
-                                        rfd::FileDialog::new().add_filter("二进制", &["bin"]),
-                                    )
-                                    .set_file_name("backup_before.bin")
-                                    .save_file()
-                                    {
-                                        self.cfg.backup_path = path;
-                                    }
-                                }
-                            });
-                        });
-                        ui.add_space(14.0);
-
-                        ui.add_space(12.0);
-                        ui.label(
-                            RichText::new("运行日志固定在底部面板，可拖拽上边缘调整高度")
-                                .size(10.0)
-                                .color(p.text3),
-                        );
-                        ui.add_space(8.0);
+                        }
                     });
             });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(if capped {
+                format!(
+                    "{label} · 仅显示前 {} MiB（可在左侧更换固件）",
+                    HEX_VIEW_LIMIT / 1024 / 1024
+                )
+            } else {
+                format!("{label} · {} 字节 · 虚拟滚动，只渲染可见行", bytes.len())
+            })
+            .size(9.5)
+            .color(p.text3),
+        );
     }
 
     /// Fixed, resizable console dock below the work area (DSH "tool bench").
@@ -1723,6 +2124,167 @@ impl App {
                             });
                     });
             });
+    }
+
+    /// The serial page replaces the old duplicated probe list: the centre
+    /// panel shows port details instead of the workbench's flashing form.
+    fn draw_serial_center(&mut self, ui: &mut Ui, p: Palette) {
+        ui.label(RichText::new("串口识别").size(22.0).strong().color(p.text));
+        ui.label(
+            RichText::new("识别当前连接的串口设备，自动标注 DAPLink / CMSIS-DAP 自带的虚拟串口")
+                .size(12.0)
+                .color(p.text3),
+        );
+        ui.add_space(16.0);
+
+        let total = self.ports.len();
+        let vcp = self.ports.iter().filter(|x| x.is_debug_vcp()).count();
+        let busy = self.ports.iter().filter(|x| !x.openable).count();
+        Self::card(ui, p, "连接概览", |ui| {
+            egui::Grid::new("serial_summary_grid")
+                .num_columns(3)
+                .spacing([36.0, 8.0])
+                .show(ui, |ui| {
+                    for (label, value, color) in [
+                        ("在线串口", total.to_string(), p.text),
+                        ("调试器虚拟串口", vcp.to_string(), p.accent),
+                        (
+                            "被占用 / 不可用",
+                            busy.to_string(),
+                            if busy > 0 { p.warn } else { p.success },
+                        ),
+                    ] {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(label).size(10.0).color(p.text3));
+                            ui.label(RichText::new(value).size(20.0).strong().color(color));
+                        });
+                    }
+                    ui.end_row();
+                });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "每 2 秒自动检测一次 · 插入 / 拔出调试器时，其虚拟串口会与调试接口一起出现或消失。",
+                )
+                .size(10.0)
+                .color(p.text3),
+            );
+        });
+        ui.add_space(14.0);
+
+        if self.ports.is_empty() {
+            Self::card(ui, p, "端口列表", |ui| {
+                ui.label(
+                    RichText::new(
+                        "当前没有检测到串口设备。插入 USB 转串口或带虚拟串口的调试器后，会自动出现在这里。",
+                    )
+                    .size(12.0)
+                    .color(p.text3),
+                );
+            });
+            return;
+        }
+
+        let ports = self.ports.clone();
+        let selected = self.selected_port.clone();
+        let probe_id = self
+            .cfg
+            .probe_id
+            .clone()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut picked: Option<String> = None;
+        for port in &ports {
+            let active = selected.as_deref() == Some(port.name.as_str());
+            let same_probe = port
+                .vid_pid()
+                .is_some_and(|id| probe_id.starts_with(&id));
+            let vid_pid = port.vid_pid().unwrap_or_else(|| "—".to_owned());
+            let iface = port
+                .interface
+                .map(|i| format!("MI_{i:02}"))
+                .unwrap_or_else(|| "—".to_owned());
+            let instance = if port.instance_id.is_empty() {
+                "—".to_owned()
+            } else {
+                port.instance_id.clone()
+            };
+            let link = if same_probe {
+                "是 · 与当前调试探针同一 USB 设备".to_owned()
+            } else {
+                "否".to_owned()
+            };
+            let rows = [
+                ("设备描述", port.description.clone()),
+                ("设备对象", port.device_object.clone()),
+                ("VID:PID", vid_pid),
+                ("USB 接口", iface),
+                ("设备实例 ID", instance),
+                ("关联当前探针", link),
+            ];
+            Frame::new()
+                .fill(if active { p.accent_soft } else { p.card })
+                .stroke(Stroke::new(1.0, if active { p.accent } else { p.border }))
+                .corner_radius(12.0)
+                .inner_margin(16.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(port.name.as_str())
+                                .size(18.0)
+                                .strong()
+                                .color(p.text),
+                        );
+                        ui.label(
+                            RichText::new(format!("· {}", port.kind.label()))
+                                .size(11.0)
+                                .color(if port.is_debug_vcp() { p.accent } else { p.text2 }),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(if port.openable {
+                                        "● 可打开"
+                                    } else {
+                                        "● 被占用 / 不可用"
+                                    })
+                                    .size(10.0)
+                                    .color(if port.openable { p.success } else { p.warn }),
+                                );
+                            },
+                        );
+                    });
+                    ui.add_space(8.0);
+                    egui::Grid::new(port.name.as_str())
+                        .num_columns(2)
+                        .spacing([16.0, 5.0])
+                        .show(ui, |ui| {
+                            for (key, value) in &rows {
+                                ui.label(RichText::new(*key).size(10.0).color(p.text3));
+                                ui.label(
+                                    RichText::new(value.as_str()).size(10.0).color(p.text2),
+                                );
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(if active { "已选中" } else { "选中" }).clicked() {
+                            picked = Some(port.name.clone());
+                        }
+                        if ui.button("复制 COM 号").clicked() {
+                            ui.ctx().copy_text(port.name.clone());
+                            self.push_log(Level::Info, format!("已复制 {}", port.name));
+                        }
+                    });
+                });
+            ui.add_space(10.0);
+        }
+        if let Some(name) = picked {
+            self.selected_port = Some(name);
+        }
     }
 
     fn draw_status(&mut self, root: &mut egui::Ui, p: Palette) {
@@ -1863,13 +2425,29 @@ fn level_color(l: Level, p: Palette) -> Color32 {
 mod tests {
     use super::*;
 
+    /// The old "调试探针" page duplicated the workbench probe selector; the
+    /// rail now opens a dedicated serial-port page with its own centre panel.
+    #[test]
+    fn probe_page_was_replaced_by_a_serial_page() {
+        let source = include_str!("app.rs");
+        assert!(Nav::Serial.title().contains("串口"));
+        // Split literals so the guard does not match its own source line.
+        assert!(!source.contains(concat!("Nav::", "Devices")));
+        assert!(!source.contains(concat!("sidebar_", "devices")));
+        assert!(source.contains("self.draw_serial_center(ui, p)"));
+        assert!(source.contains("Event::SerialPorts(items)"));
+        assert!(source.contains("spawn_serial_watcher"));
+        // Probe selection still belongs to the workbench.
+        assert!(source.contains("Job::RefreshProbes"));
+    }
+
     /// Regression guard: the OS title bar and the in-app top bar used to both
     /// print "ProbeRS Studio · 固件烧录工作台", producing a duplicate heading.
     #[test]
     fn top_bar_never_repeats_the_window_title() {
         let pages = [
             Nav::Workbench,
-            Nav::Devices,
+            Nav::Serial,
             Nav::Chips,
             Nav::Logs,
             Nav::Settings,
@@ -1968,11 +2546,12 @@ mod tests {
     fn every_file_picker_offers_all_files() {
         let source = include_str!("app.rs");
         let helper = concat!("with_all_", "files(");
-        // One helper definition + chip support, chip description, firmware,
-        // log export and backup path = 6 occurrences.
-        assert_eq!(source.matches(helper).count(), 6);
+        // One helper definition + chip support, chip description, sidebar
+        // firmware picker, log export, backup path and the hex viewer's
+        // browse button = 7 occurrences.
+        assert_eq!(source.matches(helper).count(), 7);
         let open_first = concat!("with_all_", "files(rfd::FileDialog::new())");
-        assert_eq!(source.matches(open_first).count(), 3);
+        assert_eq!(source.matches(open_first).count(), 4);
         assert!(source.contains(concat!("全部文件 (*.", "*)")));
     }
 
@@ -2057,5 +2636,72 @@ mod tests {
         let mut blank = vec![];
         seed_recent_chips(&mut blank, "   ");
         assert!(blank.is_empty());
+    }
+
+    /// Config + firmware + actions live in the narrow "当前会话" rail; the
+    /// centre pane is now a hex viewer instead of three oversized cards.
+    #[test]
+    fn workbench_controls_live_in_the_session_sidebar() {
+        let source = include_str!("app.rs");
+        for section in [
+            concat!("fn session_", "connection"),
+            concat!("fn session_", "firmware"),
+            concat!("fn session_", "actions"),
+            concat!("fn draw_hex_", "viewer"),
+        ] {
+            assert!(source.contains(section), "missing {section}");
+        }
+        for old in [
+            concat!("Self::card(ui, p, \"连接", "配置\""),
+            concat!("Self::card(ui, p, \"烧录选项", "与操作\""),
+            concat!("RichText::new(\"连接与", "烧录\")"),
+        ] {
+            assert!(!source.contains(old), "old centre card returned: {old}");
+        }
+        assert!(source.contains(concat!("self.draw_hex_", "viewer(ui, p)")));
+    }
+
+    #[test]
+    fn hex_dump_rows_are_padded_and_addressable() {
+        let data = b"HELLO\x00WORLD\xff\x01!";
+        let (off, hex, gutter) = format_hex_row(data, 0x0800_0000, 0, 8, true);
+        assert_eq!(off, "08000000");
+        assert_eq!(hex, "48 45 4C 4C 4F 00 57 4F");
+        assert_eq!(gutter, "HELLO.WO");
+        let (off2, hex2, gutter2) = format_hex_row(data, 0x0800_0000, 1, 8, true);
+        assert_eq!(off2, "08000008");
+        assert!(hex2.starts_with("52 4C 44 FF 01 21"));
+        assert_eq!(hex2.len(), 8 * 3 - 1, "short rows keep fixed width");
+        assert_eq!(gutter2, "RLD..!");
+        let (_, _, no_ascii) = format_hex_row(data, 0, 0, 8, false);
+        assert!(no_ascii.is_empty());
+    }
+
+    #[test]
+    fn hex_view_prefers_the_decoded_image() {
+        let view = FirmwareView {
+            raw: Arc::from(b":10000000".as_slice()),
+            image: Some(Arc::from(b"\x01\x02".as_slice())),
+            image_base: 0x0800_0000,
+        };
+        let (bytes, base, label) = resolve_hex_view(Some(&view), HexSource::Image);
+        assert_eq!(bytes, &[1, 2]);
+        assert_eq!(base, 0x0800_0000);
+        assert_eq!(label, "固件镜像");
+        let (raw, raw_base, raw_label) = resolve_hex_view(Some(&view), HexSource::File);
+        assert_eq!(raw, b":10000000");
+        assert_eq!(raw_base, 0);
+        assert_eq!(raw_label, "文件原始字节");
+        // ELF / malformed HEX / unknown extension: fall back to raw bytes.
+        let no_image = FirmwareView {
+            raw: Arc::from(b"\x7fELF".as_slice()),
+            image: None,
+            image_base: 0,
+        };
+        assert_eq!(
+            resolve_hex_view(Some(&no_image), HexSource::Image).2,
+            "文件原始字节"
+        );
+        assert!(resolve_hex_view(None, HexSource::Image).0.is_empty());
     }
 }

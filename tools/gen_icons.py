@@ -68,12 +68,12 @@ def geometry():
         l(30, 12, 30, 52, 3.0),
         l(30, 32, 54, 32, 3.0),
     ]
-    devices = [
-        r(32, 27, 36, 26, 5),
-        c(24, 27, 2.7, filled=True),
-        c(34, 27, 2.7, 2.2),
-        l(32, 40, 32, 50, 3.2),
-        r(32, 54, 18, 8, 2, 3.0),
+    serial = [
+        r(32, 29, 40, 26, 5),
+        c(22, 29, 2.7, filled=True),
+        c(32, 29, 2.7, 2.2),
+        c(42, 29, 2.7, 2.2),
+        l(32, 42, 32, 54, 3.2),
     ]
     chips = [r(32, 32, 24, 24, 3)]
     for y in (25, 32, 39):
@@ -98,7 +98,7 @@ def geometry():
     logo.append(poly(BOLT, filled=True))
     return {
         "workbench": workbench,
-        "devices": devices,
+        "serial": serial,
         "chips": chips,
         "logs": logs,
         "settings": settings,

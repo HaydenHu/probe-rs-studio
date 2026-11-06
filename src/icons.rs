@@ -18,7 +18,7 @@ const VIEW: f32 = 64.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconKind {
     Workbench,
-    Devices,
+    Serial,
     Chips,
     Logs,
     Settings,
@@ -76,7 +76,7 @@ impl IconSet {
         Self {
             nav: [
                 Icon::from_svg(include_str!("../assets/icons/workbench.svg")),
-                Icon::from_svg(include_str!("../assets/icons/devices.svg")),
+                Icon::from_svg(include_str!("../assets/icons/serial.svg")),
                 Icon::from_svg(include_str!("../assets/icons/chips.svg")),
                 Icon::from_svg(include_str!("../assets/icons/logs.svg")),
                 Icon::from_svg(include_str!("../assets/icons/settings.svg")),

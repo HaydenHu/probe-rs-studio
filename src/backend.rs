@@ -150,6 +150,8 @@ pub enum Event {
     },
     Chips(Vec<ChipItem>),
     ChipDetails(String),
+    /// Fresh list of currently attached serial ports (see `spawn_serial_watcher`).
+    SerialPorts(Vec<crate::serial::SerialPort>),
     Connected(String),
     Progress { value: f32, label: String },
     Finished { ok: bool, summary: String, elapsed: f32 },
@@ -374,6 +376,52 @@ impl WatcherControl {
             busy: AtomicBool::new(false),
         }
     }
+}
+
+/// Poll the OS serial-port list and push an event whenever a COM port appears,
+/// disappears or changes state (e.g. a DAPLink virtual COM port being opened
+/// by another program). Registry + SetupAPI reads never touch the debug probe,
+/// so this keeps running while a flashing job owns the debugger.
+pub fn spawn_serial_watcher(
+    tx: Sender<Event>,
+    control: Arc<WatcherControl>,
+    interval: Duration,
+    notify: impl Fn() + Send + Sync + 'static,
+) {
+    let _ = std::thread::Builder::new()
+        .name("serial-port-watch".to_owned())
+        .spawn(move || {
+            // (COM names, full signatures): names drive the log, signatures
+            // also catch state changes such as "port now busy".
+            let mut baseline: Option<(Vec<String>, Vec<String>)> = None;
+            loop {
+                if !control.enabled.load(Ordering::Relaxed) {
+                    std::thread::sleep(interval);
+                    continue;
+                }
+                let ports = crate::serial::enumerate();
+                let names: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+                let signatures: Vec<String> =
+                    ports.iter().map(|p| p.signature()).collect();
+                let changed = baseline
+                    .as_ref()
+                    .map_or(true, |(_, sigs)| *sigs != signatures);
+                if changed {
+                    if let Some((previous, _)) = &baseline {
+                        for added in names.iter().filter(|n| !previous.contains(n)) {
+                            log(&tx, Level::Ok, format!("检测到串口插入: {added}"));
+                        }
+                        for removed in previous.iter().filter(|n| !names.contains(n)) {
+                            log(&tx, Level::Warn, format!("检测到串口拔出: {removed}"));
+                        }
+                    }
+                    baseline = Some((names, signatures));
+                    let _ = tx.send(Event::SerialPorts(ports));
+                    notify();
+                }
+                std::thread::sleep(interval);
+            }
+        });
 }
 
 /// Watch USB debug probes and push a fresh list whenever a probe is plugged in
