@@ -49,17 +49,24 @@ fn main() -> eframe::Result<()> {
             eprintln!("用法: probe-rs-studio.exe --selftest <固件路径> [芯片型号] [--write]");
             std::process::exit(2);
         };
-        let mut cfg = backend::FlashConfig::default();
+        // Reuse the GUI's saved link settings (stable probe identity + SWD
+        // speed). A headless run with the bare 1000 kHz default would attach
+        // under different conditions and cannot reproduce UI flash failures.
+        let mut cfg = saved_flash_config().unwrap_or_default();
         cfg.firmware = Some(std::path::PathBuf::from(firmware));
         if let Some(chip) = args.get(pos + 2).filter(|s| !s.starts_with("--")) {
             cfg.chip = chip.clone();
         }
+        if let Some(speed) = cli_opt(&args, "--speed").and_then(|s| s.parse::<u32>().ok()) {
+            cfg.speed_khz = speed;
+        }
         cfg.backup_path = std::path::PathBuf::from("backup_selftest.bin");
         let write = args.iter().any(|a| a == "--write");
         println!(
-            "自检: {} · {} · {} · {}",
+            "自检: {} · {} · {} kHz · {} · {}",
             cfg.firmware.as_ref().unwrap().display(),
             cfg.chip,
+            cfg.speed_khz,
             if write { "含写入" } else { "只读" },
             cfg.backup_path.display()
         );

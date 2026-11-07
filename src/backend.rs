@@ -285,7 +285,81 @@ pub fn selftest(cfg: &FlashConfig, write_flash: bool) -> Result<()> {
     Ok(())
 }
 
+/// How many times a probe I/O job is attempted before giving up. Cheap
+/// CMSIS-DAP v1 adapters (DAPLink clones among them) occasionally drop a HID
+/// report or answer a command with a stale one; a whole retry of an idempotent
+/// operation recovers without the user having to press the button again.
+const PROBE_JOB_ATTEMPTS: usize = 3;
+const PROBE_RETRY_DELAY: Duration = Duration::from_millis(300);
+
+/// Whether a failed job may safely be run again from the beginning.
+///
+/// Flash programming rewrites the same image, read-back/verify/connect are
+/// read-only, and erase/reset are idempotent. Option-byte *writes* are excluded:
+/// repeating a programming cycle on the configuration NVM is not worth the
+/// risk of leaving the chip in a locked state.
+fn job_is_retryable(job: &Job) -> bool {
+    matches!(
+        job,
+        Job::Connect(_)
+            | Job::ReadBack(_)
+            | Job::Flash(_)
+            | Job::VerifyFirmware(_)
+            | Job::EraseAll(_)
+            | Job::Reset(_)
+            | Job::ReadOptionBytes { .. }
+    )
+}
+
+/// Only transport-level hiccups justify a retry. A missing firmware file, a
+/// failed verification or a rejected option-byte image must surface at once.
+fn is_transient_probe_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_lowercase();
+    const HINTS: &[&str] = &[
+        "command id in response",
+        "communication with",
+        "arm specific error",
+        "no target responded",
+        "did not respond to request",
+        "debug probe encountered an error",
+        "timeout",
+        "timedout",
+        "usb error",
+    ];
+    HINTS.iter().any(|hint| text.contains(hint))
+}
+
 fn run(job: Job, tx: &Sender<Event>) -> Result<String> {
+    let attempts = if job_is_retryable(&job) {
+        PROBE_JOB_ATTEMPTS
+    } else {
+        1
+    };
+    for attempt in 1..=attempts {
+        let result = run_once(job.clone(), tx);
+        let Err(err) = result else {
+            return result;
+        };
+        if attempt == attempts || !is_transient_probe_error(&err) {
+            return Err(err);
+        }
+        // Back off between attempts: a DAPLink that just dropped its HID
+        // queue needs progressively longer to become responsive again.
+        let delay = PROBE_RETRY_DELAY * attempt as u32;
+        log(
+            tx,
+            Level::Warn,
+            format!(
+                "探针通信中断（第 {attempt}/{attempts} 次失败），{} ms 后自动重试：{err:#}",
+                delay.as_millis()
+            ),
+        );
+        std::thread::sleep(delay);
+    }
+    unreachable!("retry loop always returns")
+}
+
+fn run_once(job: Job, tx: &Sender<Event>) -> Result<String> {
     match job {
         Job::RefreshProbes => refresh_probes(tx),
         Job::LoadChips => load_chips(tx),
@@ -1568,5 +1642,51 @@ mod tests {
         assert!(!option_bytes::profile_for_chip("PY32F002Bxx").writable);
         assert!(!option_bytes::profile_for_chip("STM32F103C8").writable);
         assert_eq!(option_bytes::OB_IMAGE_LEN, 16);
+    }
+
+    /// Idempotent probe jobs get another chance after a HID hiccup, while a
+    /// configuration-NVM write must never be replayed automatically.
+    #[test]
+    fn retry_policy_is_limited_to_safe_jobs() {
+        let cfg = || Box::new(FlashConfig::default());
+        assert!(job_is_retryable(&Job::Connect(cfg())));
+        assert!(job_is_retryable(&Job::ReadBack(cfg())));
+        assert!(job_is_retryable(&Job::Flash(cfg())));
+        assert!(job_is_retryable(&Job::VerifyFirmware(cfg())));
+        assert!(job_is_retryable(&Job::EraseAll(cfg())));
+        assert!(job_is_retryable(&Job::ReadOptionBytes {
+            cfg: cfg(),
+            base: 0,
+        }));
+        assert!(!job_is_retryable(&Job::WriteOptionBytes {
+            cfg: cfg(),
+            base: 0,
+            image: ObImage::default(),
+            acknowledged: true,
+        }));
+        assert!(!job_is_retryable(&Job::RefreshProbes));
+        assert_eq!(PROBE_JOB_ATTEMPTS, 3);
+    }
+
+    /// Only transport-level failures are retried; a real verification error or
+    /// a missing file must be reported immediately.
+    #[test]
+    fn only_transport_errors_trigger_a_retry() {
+        assert!(is_transient_probe_error(&anyhow!(
+            "Command ID in response (0x0) does not match sent command ID (Transfer - 0x5)"
+        )));
+        assert!(is_transient_probe_error(&anyhow!(
+            "An ARM specific error occurred: No target responded to the debug port"
+        )));
+        assert!(is_transient_probe_error(&anyhow!(
+            "hidapi error: WinError: WaitTimedOut"
+        )));
+        assert!(!is_transient_probe_error(&anyhow!("请先选择固件文件")));
+        assert!(!is_transient_probe_error(&anyhow!(
+            "校验失败: SHA256 不一致"
+        )));
+        assert!(!is_transient_probe_error(&anyhow!(
+            "选项字节反码校验失败，拒绝写入"
+        )));
     }
 }

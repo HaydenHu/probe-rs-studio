@@ -13,7 +13,13 @@
 
 本仓库 `Cargo.toml` 通过 git 依赖引用 fork 的 `daplink-hid-fallback` 分支，因此单独 clone 本仓库即可构建。
 
-补丁内容：`find_packet_size()` 在 16 次 `DAP_Info(PacketSize)` 超时后，对 CMSIS-DAP v1 HID 设备回退到 HID 报告描述符给出的 `report_size`，而不是报 `NoPacketSize`。部分 DAPLink 固件不实现该命令。
+补丁内容（均在 `daplink-hid-fallback` 分支）：
+
+1. `find_packet_size()` 在 16 次 `DAP_Info(PacketSize)` 超时后，对 CMSIS-DAP v1 HID 设备回退到 HID 报告描述符给出的 `report_size`，而不是报 `NoPacketSize`。部分 DAPLink 固件不实现该命令。
+2. **跳过陈旧回复**：这类探针会在 HID 输入队列里留下上一个会话 / 超时命令的回复（实测多为 `[00 02 40 00]`，即 `DAP_Info(PacketSize)=64`），当前命令读到别人的回执就报 `CommandIdMismatch(0x0, ...)`，长流程烧录会在 Program 中途失败。接收端现在会丢弃不属于当前命令的回执（上限 16 个），直到拿到自己的回复；同时忽略空闲时发出的全 0 HID 报告，并把 Windows 的 `WinError: WaitTimedOut` 归一为可重试的超时。
+3. **控制命令自动重同步**：`DAP_Transfer` / `DAP_TransferBlock` 不重试（重复 SWD 写会推进 AP 地址），其余控制类命令在重同步后重试一次；打开探针阶段对超时也重试，给刚结束上一轮会话的固件留出恢复时间。
+
+GUI 侧另有兜底：`Connect` / `ReadBack` / `Flash` / `VerifyFirmware` / `EraseAll` / `Reset` 遇到传输层错误时按 300 / 600 / 900 ms 退避，最多重试 3 次（写相同镜像是幂等的）；**选项字节写入不参与自动重试**，配置错误、文件缺失、校验失败也不会被重试。
 
 ## 功能
 
@@ -28,6 +34,7 @@
 - **最近确认的型号**：点选、连接或烧录时自动记录（最多 8 个），搜索框下方给出随输入过滤的快捷按钮，型号列表把历史置顶并标注「· 最近」，工作台也能一键切回；随配置持久化，旧配置自动以当前已选型号作为首条历史
 - HEX / ELF / BIN 固件解析（地址区间、记录数、SHA256），支持拖拽载入
 - 一键烧录、库内 verify、独立读回 SHA256 比对、烧录前读回备份、复位运行、整片擦除（二次确认）
+- **不稳定的 DAPLink 容错**：自动跳过错位的 HID 回执与空闲全 0 报告，控制命令重同步，传输类失败按退避自动重试整个幂等任务（详见「两个仓库」）
 - 深浅双主题、SVG 矢量导航图标（运行时用 epaint 直接绘制，无位图纹理）、可折叠日志台、进度与状态栏
 - 配置自动保存到可执行文件同目录的 `probe-rs-studio.json`
 
@@ -372,8 +379,12 @@ OB 区 0x1FFF0E80 · 16 字节
 # 只读自检：探针枚举、连接、读回、独立校验（不写入 Flash）
 probe-rs-studio.exe --selftest <firmware.hex> PY32F003x8
 
-# 完整自检，含真实烧录与复位
+# 完整自检，含真实烧录与独立读回校验
 probe-rs-studio.exe --selftest <firmware.hex> PY32F003x8 --write
+
+# 自检默认复用 probe-rs-studio.json 里保存的探针身份与 SWD 速度（与 GUI 完全一致），
+# 可用 --speed 临时覆盖，便于对比不同时钟下的稳定性
+probe-rs-studio.exe --selftest <firmware.hex> --write --speed 4000
 
 # 打印调试探针热插拔事件，N 秒内可插拔 USB 观察
 probe-rs-studio.exe --watch 8
@@ -398,7 +409,7 @@ probe-rs-studio.exe --option-bytes PY32F003x8 --ob-base 0x1FFF0E80 --speed 10000
 probe-rs-studio.exe --ob-open
 
 # 单元测试（hex 查看器、pack 转换、串口枚举 / 参数 / HEX 解析、定时发送、缩放、快捷输入、
-# 选项字节编解码与反码、矢量图标、主题配色、热插拔 diff、Registry 解析 OPT 算法）
+# 选项字节编解码与反码、探针任务重试策略、矢量图标、主题配色、热插拔 diff、Registry 解析 OPT 算法）
 cargo test --release --bin probe-rs-studio
 ```
 
@@ -408,7 +419,11 @@ cargo test --release --bin probe-rs-studio
 
 - 探针：DAPLink `c251:f001`，序列号 `LU_2022_8888`，CMSIS-DAP v1 HID（64 字节报告）
 - 目标：PY32F003x8（Armv6-M，64KB Flash / 8KB RAM）
-- 结果：烧录约 2.54 秒，库内校验 + 独立读回 SHA256 一致 + 复位成功
+- 结果：烧录约 2 秒，库内校验 + 独立读回 SHA256 一致 + 复位成功
+- **烧录稳定性（v0.2.0）**：修复前 10 次连接仅 6 次成功，烧录常在 Erase/Program 阶段报
+  `Command ID in response (0x0) does not match sent command ID (Transfer - 0x5)`；修复后
+  `--option-bytes` 连续 10 次连接 **10/10 成功**，完整 `--selftest --write`
+  （备份 → 烧录 4111 字节 → 独立读回 SHA256 比对）零重试通过，`[PASS] 读回完全一致`。
 - DAPLink 虚拟串口 `COM10`（`c251:f001`，`MI_00`）：识别为「调试器虚拟串口」；**TX/RX 短接回环**
   115200 8N1 下文本 / HEX / 彩色 emoji 发送与接收、定时发送、Ctrl+滚轮缩放全部验证通过
 - 选项字节：`--option-bytes` 在 10000 kHz 下只读读出 `0x1FFF0E80` 的 16 字节，
