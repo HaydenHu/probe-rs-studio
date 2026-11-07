@@ -9,7 +9,7 @@ use std::{
         mpsc::{channel, Receiver, Sender},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use egui::{
@@ -67,12 +67,98 @@ fn default_true() -> bool {
     true
 }
 
+fn default_timer_ms() -> u32 {
+    SERIAL_TIMER_DEFAULT_MS
+}
+
+fn default_rx_font() -> f32 {
+    SERIAL_FONT_DEFAULT_RX
+}
+
+fn default_tx_font() -> f32 {
+    SERIAL_FONT_DEFAULT_TX
+}
+
 /// Guard against accidentally dropping a huge file onto the window. Firmware
 /// images are small; the viewer only keeps this many bytes in memory.
 const HEX_VIEW_LIMIT: usize = 32 * 1024 * 1024;
 
 /// Rolling buffer for the serial terminal's receive pane.
 const SERIAL_RX_LIMIT: usize = 64 * 1024;
+
+/// Default period for the "定时发送" checkbox (milliseconds).
+const SERIAL_TIMER_DEFAULT_MS: u32 = 1000;
+/// Bounds for a periodic send: below 100 ms the egui repaint loop cannot keep
+/// up, above one hour is almost certainly a typo.
+const SERIAL_TIMER_MIN_MS: u64 = 100;
+const SERIAL_TIMER_MAX_MS: u64 = 3_600_000;
+
+/// Font sizes for the serial RX / TX panes, adjustable with Ctrl + wheel.
+const SERIAL_FONT_DEFAULT_RX: f32 = 11.5;
+const SERIAL_FONT_DEFAULT_TX: f32 = 13.0;
+const SERIAL_FONT_MIN: f32 = 8.0;
+const SERIAL_FONT_MAX: f32 = 32.0;
+
+/// Quick-insert palette for the serial send box. Emoji are handy for testing
+/// UTF-8 payloads; the trailing commands are the usual bring-up strings for
+/// modules and modems. Everything is inserted as real characters, never as
+/// escape text, so the bytes on the wire are exactly what is shown.
+const QUICK_EMOJI: &[&str] = &[
+    "😀", "😂", "😍", "🤔", "😎", "😭", "👍", "👎", "👏", "🙏", "💪", "✌", "❤", "🔥", "✅", "❌",
+    "⚠", "⭐", "🎉", "💡", "🚀", "📡", "🔌", "🔧", "🐛", "⏰", "📦", "🎯",
+];
+const QUICK_COMMANDS: &[(&str, &str)] = &[
+    ("AT", "AT"),
+    ("AT+GMR", "AT+GMR"),
+    ("AT+RST", "AT+RST"),
+    ("CRLF", "\r\n"),
+    ("00 FF", "00 FF"),
+];
+
+/// Insert `insert` at a character-index caret (NOT a byte offset) and move
+/// the caret past the inserted characters. Kept pure so the UTF-8 / emoji
+/// behaviour is unit-testable without constructing an egui app.
+fn insert_at_caret(text: &mut String, caret: &mut usize, insert: &str) {
+    let mut chars: Vec<char> = text.chars().collect();
+    let mut at = (*caret).min(chars.len());
+    for c in insert.chars() {
+        chars.insert(at, c);
+        at += 1;
+    }
+    *text = chars.into_iter().collect();
+    *caret = at;
+}
+
+/// egui's `zoom_delta()` is 1.0 for "no change", >1 for ctrl+wheel up or a
+/// pinch-out gesture. Map one wheel notch to roughly one font point.
+fn font_zoom_delta(factor: f32) -> f32 {
+    if !factor.is_finite() || factor <= 0.0 {
+        return 0.0;
+    }
+    // log2 makes zoom-in / zoom-out symmetric: 1.1 and 1/1.1 cancel out.
+    factor.clamp(0.5, 2.0).log2() * 8.0
+}
+
+/// Whether a periodic-send tick is due. `Instant::duration_since` saturates
+/// at zero, so a clock that jumps backwards cannot panic here.
+fn timer_due(last: Option<Instant>, now: Instant, period: Duration) -> bool {
+    !last.is_some_and(|t| now.duration_since(t) < period)
+}
+
+fn clamp_font_size(size: f32, delta: f32) -> f32 {
+    if !size.is_finite() {
+        return SERIAL_FONT_DEFAULT_RX;
+    }
+    (size + delta).clamp(SERIAL_FONT_MIN, SERIAL_FONT_MAX)
+}
+
+/// Validated periodic-send period in milliseconds.
+fn parse_timer_ms(text: &str) -> Option<u64> {
+    text.trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|v| (SERIAL_TIMER_MIN_MS..=SERIAL_TIMER_MAX_MS).contains(v))
+}
 
 fn append_rx(buffer: &mut Vec<u8>, bytes: &[u8], limit: usize) {
     buffer.extend_from_slice(bytes);
@@ -208,6 +294,18 @@ struct Settings {
     /// keeps settings files written by older versions readable.
     #[serde(default)]
     serial: SerialSettings,
+    /// Periodic-send period and quick-input panel visibility. The *enabled*
+    /// flag is deliberately not persisted, so the app never starts sending
+    /// on its own after a restart.
+    #[serde(default = "default_timer_ms")]
+    serial_timer_ms: u32,
+    #[serde(default)]
+    serial_emoji_open: bool,
+    /// Per-pane font sizes (Ctrl + wheel to zoom).
+    #[serde(default = "default_rx_font")]
+    serial_rx_font_size: f32,
+    #[serde(default = "default_tx_font")]
+    serial_tx_font_size: f32,
     addr_text: String,
     size_text: String,
     bin_base_text: String,
@@ -342,6 +440,19 @@ pub struct App {
     serial_append_nl: bool,
     serial_rx_bytes: usize,
     serial_tx_bytes: usize,
+    /// Periodic send ("定时发送"): period text, effective period, last tick,
+    /// number of payloads emitted and whether the loop is armed.
+    serial_timer_on: bool,
+    serial_timer_ms: u32,
+    serial_timer_text: String,
+    serial_last_tick: Option<Instant>,
+    serial_timer_sent: usize,
+    /// Quick-input panel toggle and the last caret position (a character
+    /// index, not a byte offset) of the send box.
+    serial_emoji_open: bool,
+    serial_tx_cursor: usize,
+    serial_rx_font_size: f32,
+    serial_tx_font_size: f32,
     chip_search: String,
     chip_details: String,
     firmware: Option<FirmwareInfo>,
@@ -449,6 +560,10 @@ impl App {
             recent: vec![],
             recent_chips: vec![],
             serial: SerialSettings::default(),
+            serial_timer_ms: SERIAL_TIMER_DEFAULT_MS,
+            serial_emoji_open: false,
+            serial_rx_font_size: SERIAL_FONT_DEFAULT_RX,
+            serial_tx_font_size: SERIAL_FONT_DEFAULT_TX,
             addr_text: "0x08000000".to_owned(),
             size_text: "4096".to_owned(),
             bin_base_text: "0x08000000".to_owned(),
@@ -490,6 +605,21 @@ impl App {
             serial_append_nl: true,
             serial_rx_bytes: 0,
             serial_tx_bytes: 0,
+            serial_timer_on: false,
+            serial_timer_ms: s.serial_timer_ms.clamp(
+                SERIAL_TIMER_MIN_MS as u32,
+                SERIAL_TIMER_MAX_MS as u32,
+            ),
+            serial_timer_text: s
+                .serial_timer_ms
+                .clamp(SERIAL_TIMER_MIN_MS as u32, SERIAL_TIMER_MAX_MS as u32)
+                .to_string(),
+            serial_last_tick: None,
+            serial_timer_sent: 0,
+            serial_emoji_open: s.serial_emoji_open,
+            serial_tx_cursor: 0,
+            serial_rx_font_size: clamp_font_size(s.serial_rx_font_size, 0.0),
+            serial_tx_font_size: clamp_font_size(s.serial_tx_font_size, 0.0),
             chip_search: s.chip_search,
             chip_details: String::new(),
             firmware: None,
@@ -622,6 +752,8 @@ impl App {
                     self.serial_open = false;
                     self.serial_open_name = None;
                     self.serial_cmd = None;
+                    self.serial_timer_on = false;
+                    self.serial_last_tick = None;
                     if !reason.is_empty() {
                         self.serial_error = Some(reason.clone());
                         if was_open {
@@ -710,6 +842,14 @@ impl App {
             recent: self.recent.clone(),
             recent_chips: self.recent_chips.clone(),
             serial: self.serial_cfg,
+            serial_timer_ms: self
+                .serial_timer_text
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(self.serial_timer_ms),
+            serial_emoji_open: self.serial_emoji_open,
+            serial_rx_font_size: self.serial_rx_font_size,
+            serial_tx_font_size: self.serial_tx_font_size,
             addr_text: self.addr_text.clone(),
             size_text: self.size_text.clone(),
             bin_base_text: self.bin_base_text.clone(),
@@ -867,6 +1007,8 @@ impl App {
         self.serial_open = true;
         self.serial_open_name = Some(name.clone());
         self.serial_error = None;
+        self.serial_last_tick = None;
+        self.serial_timer_sent = 0;
         self.push_log(Level::Info, format!("正在打开 {name} · {}", cfg.label()));
     }
 
@@ -876,11 +1018,51 @@ impl App {
         }
         self.serial_open = false;
         self.serial_open_name = None;
+        // Never leave a periodic sender armed against a closed port.
+        self.serial_timer_on = false;
+        self.serial_last_tick = None;
     }
 
-    fn send_serial(&mut self) {
+    /// Periodic send tick, driven by the egui frame loop. `ui()` already
+    /// requests a 50 ms repaint while a serial session is alive, so no extra
+    /// thread is needed. Returns true when a payload was actually queued.
+    fn tick_serial_timer(&mut self) -> bool {
+        if !self.serial_timer_on || !self.serial_open {
+            return false;
+        }
+        let Some(ms) = parse_timer_ms(&self.serial_timer_text) else {
+            return false;
+        };
+        let period = Duration::from_millis(ms);
+        let now = Instant::now();
+        if !timer_due(self.serial_last_tick, now, period) {
+            return false;
+        }
+        self.serial_last_tick = Some(now);
+        if self.serial_tx_text.trim().is_empty() {
+            return false;
+        }
+        self.send_serial(true);
+        self.serial_timer_sent = self.serial_timer_sent.saturating_add(1);
+        true
+    }
+
+    /// Insert a quick-input entry at the caret (Rust `char` index, not bytes).
+    fn insert_quick_text(&mut self, text: &str) {
+        insert_at_caret(
+            &mut self.serial_tx_text,
+            &mut self.serial_tx_cursor,
+            text,
+        );
+    }
+
+    /// `quiet` suppresses the per-payload DEBUG line for periodic sends;
+    /// the RX/TX counters still update through the worker's events.
+    fn send_serial(&mut self, quiet: bool) {
         if !self.serial_open {
-            self.push_log(Level::Warn, "请先打开串口再发送数据");
+            if !quiet {
+                self.push_log(Level::Warn, "请先打开串口再发送数据");
+            }
             return;
         }
         let text = self.serial_tx_text.clone();
@@ -889,7 +1071,9 @@ impl App {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     self.serial_error = Some(err.clone());
-                    self.push_log(Level::Error, format!("HEX 发送内容无效: {err}"));
+                    if !quiet {
+                        self.push_log(Level::Error, format!("HEX 发送内容无效: {err}"));
+                    }
                     return;
                 }
             }
@@ -906,12 +1090,17 @@ impl App {
             Some(tx) => match tx.send(SerialCommand::Send(payload.clone())) {
                 Ok(()) => {
                     self.serial_error = None;
-                    self.push_log(
-                        Level::Debug,
-                        format!("TX {} 字节: {}", payload.len(), preview_bytes(&payload)),
-                    );
+                    if !quiet {
+                        self.push_log(
+                            Level::Debug,
+                            format!("TX {} 字节: {}", payload.len(), preview_bytes(&payload)),
+                        );
+                    }
                 }
-                Err(_) => self.push_log(Level::Error, "串口会话已断开，发送失败"),
+                Err(_) => {
+                    self.serial_timer_on = false;
+                    self.push_log(Level::Error, "串口会话已断开，发送失败");
+                }
             },
             None => self.push_log(Level::Error, "串口会话不存在，发送失败"),
         }
@@ -2520,8 +2709,10 @@ impl App {
         ui.add_space(10.0);
 
         // Leave room for the info strip and the send pane even when the
-        // bottom log dock is expanded to its default height.
-        let rx_height = (ui.available_height() - 300.0).max(110.0);
+        // bottom log dock is expanded to its default height. The periodic-send
+        // row and the (optional) quick-input strip add their own height.
+        let send_extra = 32.0 + if self.serial_emoji_open { 42.0 } else { 0.0 };
+        let rx_height = (ui.available_height() - 300.0 - send_extra).max(110.0);
         let name = self
             .serial_open_name
             .clone()
@@ -2581,13 +2772,18 @@ impl App {
         let rx_hex = self.serial_rx_hex;
         let auto_scroll = self.serial_auto_scroll;
         let rx = self.serial_rx.clone();
+        // One zoom gesture per frame; each pane only reacts when the pointer
+        // is over it. `zoom_delta` is egui's unified ctrl+wheel / pinch value.
+        let zoom = ui.input(|i| font_zoom_delta(i.zoom_delta()));
+        let rx_size = self.serial_rx_font_size;
+        let tx_size = self.serial_tx_font_size;
         let rows = rx.len().saturating_add(15) / 16;
         let rx_text = if rx_hex {
             String::new()
         } else {
             String::from_utf8_lossy(&rx).into_owned()
         };
-        Frame::new()
+        let rx_frame = Frame::new()
             .fill(p.console)
             .stroke(Stroke::new(1.0, p.border))
             .corner_radius(10.0)
@@ -2601,6 +2797,11 @@ impl App {
                         |ui| {
                             ui.checkbox(&mut self.serial_rx_hex, "HEX 显示");
                             ui.checkbox(&mut self.serial_auto_scroll, "自动滚动");
+                            ui.label(
+                                RichText::new(format!("{:.1} pt · Ctrl+滚轮缩放", rx_size))
+                                    .size(9.0)
+                                    .color(p.text3),
+                            );
                             ui.label(
                                 RichText::new(format!("{} 字节", rx.len()))
                                     .size(9.0)
@@ -2616,38 +2817,51 @@ impl App {
                         ui.label(
                             RichText::new(format!("{:<8}", "OFFSET"))
                                 .monospace()
-                                .size(11.0)
+                                .size(rx_size)
                                 .color(p.text3),
                         );
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(format!("{:<hex_width$}", "HEX BYTES"))
                                 .monospace()
-                                .size(11.0)
+                                .size(rx_size)
                                 .color(p.text3),
                         );
                         ui.add_space(10.0);
-                        ui.label(RichText::new("ASCII").monospace().size(11.0).color(p.text3));
+                        ui.label(
+                            RichText::new("ASCII")
+                                .monospace()
+                                .size(rx_size)
+                                .color(p.text3),
+                        );
                     });
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .max_height(rx_height)
                         .stick_to_bottom(auto_scroll)
-                        .show_rows(ui, 19.0, rows, |ui, range| {
+                        .show_rows(ui, rx_size + 7.0, rows, |ui, range| {
                             for row in range {
                                 let (offset, hex, gutter) = format_hex_row(&rx, 0, row, 16, true);
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(offset).monospace().size(11.0).color(p.text3),
+                                        RichText::new(offset)
+                                            .monospace()
+                                            .size(rx_size)
+                                            .color(p.text3),
                                     );
                                     ui.add_space(10.0);
-                                    ui.label(RichText::new(hex).monospace().size(11.0).color(p.text));
+                                    ui.label(
+                                        RichText::new(hex)
+                                            .monospace()
+                                            .size(rx_size)
+                                            .color(p.text),
+                                    );
                                     ui.add_space(10.0);
                                     ui.label(
                                         RichText::new(gutter)
                                             .monospace()
-                                            .size(11.0)
+                                            .size(rx_size)
                                             .color(p.text2),
                                     );
                                 });
@@ -2663,34 +2877,95 @@ impl App {
                             ui.label(
                                 RichText::new(rx_text)
                                     .monospace()
-                                    .size(11.5)
+                                    .size(rx_size)
                                     .color(p.text2),
                             );
                         });
                 }
             });
+        if zoom != 0.0 && ui.rect_contains_pointer(rx_frame.response.rect) {
+            self.serial_rx_font_size = clamp_font_size(self.serial_rx_font_size, zoom);
+        }
         ui.add_space(10.0);
 
         let mut send = false;
         let mut clear_tx = false;
-        Frame::new()
+        let mut quick_insert: Option<String> = None;
+        let timer_was_on = self.serial_timer_on;
+        let tx_frame = Frame::new()
             .fill(p.card)
             .stroke(Stroke::new(1.0, p.border))
             .corner_radius(10.0)
             .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new("发送区").size(12.0).strong().color(p.text));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("发送区").size(12.0).strong().color(p.text));
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let label = if self.serial_emoji_open {
+                                "收起快捷输入"
+                            } else {
+                                "快捷输入 😀"
+                            };
+                            if ui.button(label).clicked() {
+                                self.serial_emoji_open = !self.serial_emoji_open;
+                            }
+                            ui.label(
+                                RichText::new(format!("{:.1} pt · Ctrl+滚轮缩放", tx_size))
+                                    .size(9.0)
+                                    .color(p.text3),
+                            );
+                        },
+                    );
+                });
                 ui.add_space(6.0);
-                ui.add_sized(
-                    [ui.available_width(), 52.0],
-                    egui::TextEdit::multiline(&mut self.serial_tx_text)
-                        .hint_text(if self.serial_tx_hex {
-                            "HEX 字节，例如 48 65 6C 6C 6F"
-                        } else {
-                            "输入要发送的文本…"
-                        }),
-                );
+                // `show()` (instead of `add_sized`) exposes the caret position
+                // so quick-input entries land where the user is typing.
+                let output = egui::TextEdit::multiline(&mut self.serial_tx_text)
+                    .id_salt("serial_send_box")
+                    .hint_text(if self.serial_tx_hex {
+                        "HEX 字节，例如 48 65 6C 6C 6F"
+                    } else {
+                        "输入要发送的文本…"
+                    })
+                    .desired_width(ui.available_width())
+                    .desired_rows(2)
+                    .font(FontId::new(tx_size, egui::FontFamily::Monospace))
+                    .show(ui);
+                if let Some(range) = output.cursor_range {
+                    self.serial_tx_cursor = range.primary.index.0;
+                }
+                if self.serial_emoji_open {
+                    ui.add_space(6.0);
+                    egui::ScrollArea::horizontal()
+                        .id_salt("quick_input_strip")
+                        .max_height(32.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for emoji in QUICK_EMOJI {
+                                    if ui
+                                        .small_button(*emoji)
+                                        .on_hover_text("插入到光标处")
+                                        .clicked()
+                                    {
+                                        quick_insert = Some((*emoji).to_owned());
+                                    }
+                                }
+                                ui.separator();
+                                for (label, value) in QUICK_COMMANDS {
+                                    if ui
+                                        .small_button(*label)
+                                        .on_hover_text("插入到光标处")
+                                        .clicked()
+                                    {
+                                        quick_insert = Some((*value).to_owned());
+                                    }
+                                }
+                            });
+                        });
+                }
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     if Self::primary_button(ui, p, "发送", open).clicked() {
@@ -2707,13 +2982,64 @@ impl App {
                             .color(p.text3),
                     );
                 });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.serial_timer_on, "定时发送");
+                    ui.label(RichText::new("每").size(10.0).color(p.text3));
+                    ui.add_sized(
+                        [64.0, 20.0],
+                        egui::TextEdit::singleline(&mut self.serial_timer_text)
+                            .desired_width(64.0),
+                    );
+                    ui.label(RichText::new("ms").size(10.0).color(p.text3));
+                    if parse_timer_ms(&self.serial_timer_text).is_none() {
+                        ui.label(
+                            RichText::new(format!(
+                                "周期范围 {}–{} ms",
+                                SERIAL_TIMER_MIN_MS, SERIAL_TIMER_MAX_MS
+                            ))
+                            .size(9.0)
+                            .color(p.error),
+                        );
+                    } else if !open {
+                        ui.label(
+                            RichText::new("需先打开串口").size(9.0).color(p.text3),
+                        );
+                    } else if self.serial_timer_on {
+                        ui.label(
+                            RichText::new(format!("已发 {} 次", self.serial_timer_sent))
+                                .size(9.0)
+                                .color(p.accent),
+                        );
+                    }
+                });
             });
+        if zoom != 0.0 && ui.rect_contains_pointer(tx_frame.response.rect) {
+            self.serial_tx_font_size = clamp_font_size(self.serial_tx_font_size, zoom);
+        }
         let shortcut = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl);
         if clear_tx {
             self.serial_tx_text.clear();
+            self.serial_tx_cursor = 0;
+        }
+        if let Some(text) = quick_insert {
+            self.insert_quick_text(&text);
+        }
+        if self.serial_timer_on && !timer_was_on {
+            self.serial_timer_sent = 0;
+            self.serial_last_tick = Some(Instant::now());
+            self.push_log(
+                Level::Info,
+                format!("定时发送已启动 · 每 {} ms", self.serial_timer_text.trim()),
+            );
+        } else if !self.serial_timer_on && timer_was_on {
+            self.push_log(
+                Level::Info,
+                format!("定时发送已停止 · 共 {} 次", self.serial_timer_sent),
+            );
         }
         if send || (shortcut && open) {
-            self.send_serial();
+            self.send_serial(false);
         }
     }
 
@@ -2774,13 +3100,16 @@ impl eframe::App for App {
         // Keep a clone of the context for input, repaint and global style calls.
         let ctx = root.ctx().clone();
         let got_events = self.pump();
+        // Periodic sending is driven by frames rather than a second thread.
+        // Must run before drawing so the send box and counters are current.
+        self.tick_serial_timer();
         // Keep the watcher in sync with UI state: never poll USB while a job
         // owns the debug probe, and honour the settings toggle.
         self.watch.enabled.store(self.auto_detect, Ordering::Relaxed);
         self.watch.busy.store(self.busy, Ordering::Relaxed);
         // A live terminal keeps receiving bytes while the window is idle;
         // without an explicit repaint request egui would never show them.
-        if self.busy || got_events || self.serial_open {
+        if self.busy || got_events || self.serial_open || self.serial_timer_on {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         let p = theme::palette(self.theme);
@@ -3042,6 +3371,10 @@ mod tests {
             recent: vec![],
             recent_chips: vec!["PY32F003x8".to_owned()],
             serial: SerialSettings::default(),
+            serial_timer_ms: SERIAL_TIMER_DEFAULT_MS,
+            serial_emoji_open: false,
+            serial_rx_font_size: SERIAL_FONT_DEFAULT_RX,
+            serial_tx_font_size: SERIAL_FONT_DEFAULT_TX,
             addr_text: "0x08000000".to_owned(),
             size_text: "4096".to_owned(),
             bin_base_text: "0x08000000".to_owned(),
@@ -3148,6 +3481,10 @@ mod tests {
             recent: vec![],
             recent_chips: vec![],
             serial: SerialSettings::default(),
+            serial_timer_ms: SERIAL_TIMER_DEFAULT_MS,
+            serial_emoji_open: false,
+            serial_rx_font_size: SERIAL_FONT_DEFAULT_RX,
+            serial_tx_font_size: SERIAL_FONT_DEFAULT_TX,
             addr_text: "0x08000000".to_owned(),
             size_text: "4096".to_owned(),
             bin_base_text: "0x08000000".to_owned(),
@@ -3194,5 +3531,194 @@ mod tests {
         assert!(source.contains("spawn_serial_session"));
         assert!(source.contains("Event::SerialRx(bytes)"));
         assert!(source.contains("Event::SerialClosed(reason)"));
+    }
+
+    /// Configs written before periodic send / quick input existed must still
+    /// deserialise, and the sender is never armed on startup.
+    #[test]
+    fn older_settings_without_timer_or_quick_input_still_load() {
+        let s = Settings {
+            config: FlashConfig::default(),
+            theme: ThemeMode::Dark,
+            auto_detect: true,
+            recent: vec![],
+            recent_chips: vec![],
+            serial: SerialSettings::default(),
+            serial_timer_ms: SERIAL_TIMER_DEFAULT_MS,
+            serial_emoji_open: true,
+            serial_rx_font_size: SERIAL_FONT_DEFAULT_RX,
+            serial_tx_font_size: SERIAL_FONT_DEFAULT_TX,
+            addr_text: "0x08000000".to_owned(),
+            size_text: "4096".to_owned(),
+            bin_base_text: "0x08000000".to_owned(),
+            speed_text: "1000".to_owned(),
+            chip_search: String::new(),
+        };
+        let mut value = serde_json::to_value(&s).unwrap();
+        value.as_object_mut().unwrap().remove("serial_timer_ms");
+        value.as_object_mut().unwrap().remove("serial_emoji_open");
+        let old: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(old.serial_timer_ms, SERIAL_TIMER_DEFAULT_MS);
+        assert!(!old.serial_emoji_open);
+        // The enabled flag is deliberately absent from Settings: a restart
+        // must never resume transmitting on its own.
+        let source = include_str!("app.rs");
+        let settings_body = source
+            .split("struct Settings {")
+            .nth(1)
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(!settings_body.contains("serial_timer_on"));
+    }
+
+    #[test]
+    fn periodic_send_period_is_validated() {
+        assert_eq!(parse_timer_ms("1000"), Some(1000));
+        assert_eq!(parse_timer_ms(" 250 "), Some(250));
+        assert_eq!(parse_timer_ms("0"), None);
+        assert_eq!(parse_timer_ms("99"), None);
+        assert_eq!(parse_timer_ms("-1"), None);
+        assert_eq!(parse_timer_ms("abc"), None);
+        assert_eq!(parse_timer_ms(""), None);
+        assert_eq!(parse_timer_ms("3600000"), Some(SERIAL_TIMER_MAX_MS));
+        assert_eq!(parse_timer_ms("3600001"), None);
+    }
+
+    /// Quick input inserts real UTF-8 characters at a *character* caret, so
+    /// emoji next to CJK text must not corrupt byte boundaries.
+    #[test]
+    fn quick_input_inserts_utf8_at_the_caret() {
+        let mut text = "A中Z".to_owned();
+        let mut caret = 2;
+        insert_at_caret(&mut text, &mut caret, "😀");
+        assert_eq!(text, "A中😀Z");
+        assert_eq!(caret, 3);
+        assert_eq!(text.chars().count(), 4);
+        assert!(text.len() > text.chars().count());
+        // An out-of-range caret clamps to the end instead of panicking.
+        let mut wild = usize::MAX;
+        insert_at_caret(&mut text, &mut wild, "!");
+        assert_eq!(text, "A中😀Z!");
+        assert_eq!(wild, 5);
+    }
+
+    #[test]
+    fn quick_input_palette_contains_real_emoji_and_at_commands() {
+        assert!(QUICK_EMOJI.len() >= 20);
+        for emoji in QUICK_EMOJI {
+            assert!(!emoji.is_empty());
+            assert!(emoji.chars().all(|c| !c.is_ascii()));
+        }
+        assert!(QUICK_COMMANDS
+            .iter()
+            .any(|(label, value)| *label == "CRLF" && *value == "\r\n"));
+        assert!(QUICK_COMMANDS.iter().any(|(label, _)| *label == "AT+GMR"));
+        let joined: String = QUICK_EMOJI.concat();
+        assert!(joined.len() > joined.chars().count());
+    }
+
+    #[test]
+    fn periodic_send_fires_only_after_the_period_elapses() {
+        let now = Instant::now();
+        let period = Duration::from_millis(1000);
+        assert!(timer_due(None, now, period));
+        assert!(!timer_due(Some(now), now, period));
+        assert!(!timer_due(Some(now), now + Duration::from_millis(999), period));
+        assert!(timer_due(Some(now), now + Duration::from_millis(1000), period));
+        assert!(timer_due(Some(now), now + Duration::from_secs(5), period));
+        // A clock jump backwards saturates to zero, so it must not fire early.
+        assert!(!timer_due(Some(now), now - Duration::from_secs(5), period));
+    }
+
+    #[test]
+    fn ctrl_wheel_zoom_is_symmetric_and_bounded() {
+        assert_eq!(font_zoom_delta(1.0), 0.0);
+        assert!(font_zoom_delta(1.1) > 0.0);
+        assert!(font_zoom_delta(0.9) < 0.0);
+        assert_eq!(font_zoom_delta(f32::NAN), 0.0);
+        assert_eq!(font_zoom_delta(0.0), 0.0);
+        assert_eq!(clamp_font_size(11.5, 0.0), 11.5);
+        assert_eq!(clamp_font_size(11.5, 100.0), SERIAL_FONT_MAX);
+        assert_eq!(clamp_font_size(11.5, -100.0), SERIAL_FONT_MIN);
+        assert_eq!(clamp_font_size(f32::INFINITY, 1.0), SERIAL_FONT_DEFAULT_RX);
+        let mut size = SERIAL_FONT_DEFAULT_RX;
+        size = clamp_font_size(size, font_zoom_delta(1.1));
+        size = clamp_font_size(size, font_zoom_delta(1.0 / 1.1));
+        assert!((size - SERIAL_FONT_DEFAULT_RX).abs() < 1e-4);
+    }
+
+    /// Older configs have no font-size keys; both panes must get their
+    /// defaults instead of failing to deserialise.
+    #[test]
+    fn older_settings_without_font_sizes_still_load() {
+        let s = Settings {
+            config: FlashConfig::default(),
+            theme: ThemeMode::Dark,
+            auto_detect: true,
+            recent: vec![],
+            recent_chips: vec![],
+            serial: SerialSettings::default(),
+            serial_timer_ms: SERIAL_TIMER_DEFAULT_MS,
+            serial_emoji_open: false,
+            serial_rx_font_size: SERIAL_FONT_DEFAULT_RX,
+            serial_tx_font_size: SERIAL_FONT_DEFAULT_TX,
+            addr_text: "0x08000000".to_owned(),
+            size_text: "4096".to_owned(),
+            bin_base_text: "0x08000000".to_owned(),
+            speed_text: "1000".to_owned(),
+            chip_search: String::new(),
+        };
+        let mut value = serde_json::to_value(&s).unwrap();
+        value.as_object_mut().unwrap().remove("serial_rx_font_size");
+        value.as_object_mut().unwrap().remove("serial_tx_font_size");
+        let old: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(old.serial_rx_font_size, SERIAL_FONT_DEFAULT_RX);
+        assert_eq!(old.serial_tx_font_size, SERIAL_FONT_DEFAULT_TX);
+    }
+
+    /// egui 0.37 rasterises COLR/CBDT emoji only when epaint's `color_fonts`
+    /// feature is on. egui/eframe do not forward that feature, so it must be
+    /// enabled directly on the epaint dependency.
+    #[test]
+    fn colour_emoji_feature_and_font_order_are_configured() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(manifest.contains("color_fonts"));
+        let theme = include_str!("theme.rs");
+        assert!(theme.contains("seguiemj.ttf"));
+        assert!(theme.contains("before_cjk"));
+        let app = include_str!("app.rs");
+        assert!(app.contains("font_zoom_delta"));
+        assert!(app.contains("FontId::new(tx_size"));
+        assert!(app.contains("rx_size + 7.0"));
+    }
+
+    /// A headless `--loopback` command is the quickest way to tell a wiring
+    /// problem from a GUI problem, so it must stay wired into the CLI.
+    #[test]
+    fn loopback_self_check_is_available_from_the_cli() {
+        let source = include_str!("main.rs");
+        assert!(source.contains("--loopback"));
+        assert!(source.contains("serial_loopback"));
+    }
+
+    #[test]
+    fn periodic_send_and_quick_input_are_wired_into_the_terminal() {
+        let source = include_str!("app.rs");
+        for needle in [
+            concat!("定时", "发送"),
+            "tick_serial_timer",
+            "QUICK_EMOJI",
+            "insert_at_caret",
+            "serial_timer_on",
+            "serial_emoji_open",
+            "send_serial(true)",
+            "send_serial(false)",
+        ] {
+            assert!(source.contains(needle), "missing terminal feature: {needle}");
+        }
+        let theme = include_str!("theme.rs");
+        assert!(theme.contains("seguiemj.ttf"), "emoji font fallback missing");
     }
 }

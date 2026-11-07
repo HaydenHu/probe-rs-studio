@@ -20,6 +20,9 @@
 - **会话式布局**：左侧窄栏「当前会话」集中连接配置、固件选择、烧录选项与全部操作（可滚动）；右侧会话区是已载入固件的 16 进制查看器（虚拟滚动、8/16/32 字节每行、ASCII 栏、镜像 / 文件原始字节切换）
 - 探针枚举、按设备身份选择、连接测试；USB 插入/拔出自动检测（1.5 秒轮询 + 去抖），烧录期间自动暂停轮询
 - **串口识别 + 串口终端**：纯 Rust Win32 FFI 枚举当前在线 COM 口，自动标注 DAPLink / CMSIS-DAP 自带的虚拟串口（VID/PID、接口号、占用状态），2 秒轮询自动刷新；左侧设置波特率等线路参数并独占打开，右侧会话区实时收发，支持文本 / HEX、CRLF、RX/TX 计数
+- **定时发送**：设定周期（100 ms – 1 小时）后自动重发发送区内容，显示累计次数；关闭串口或会话中断会立即停发，启用状态不写进配置，重启不会自己发
+- **彩色 emoji 快捷输入**：发送区可展开一排彩色 emoji 与常用 AT 指令，点击插入到光标处（按字符索引，中文 / emoji 混排不会切坏 UTF-8）；egui 0.37 配合 epaint `color_fonts` 与系统 Segoe UI Emoji 字体渲染真彩色字形
+- **Ctrl + 滚轮缩放**：接收区与发送区各自独立调整字号（8–32 pt），标题旁实时显示当前字号，随配置持久化
 - 内置约 4700 个芯片型号，另附 Holychip HC32F4XX 系列；**内置库没有的芯片用同一个「加载芯片支持…」入口导入厂商 `.pack` / `.pack.zip`、已解压目录，或只给一个 `.FLM` 算法**（按文件类型自动分流，纯 Rust 解析并永久保存），支持外部 `.yaml` 芯片描述
 - **最近确认的型号**：点选、连接或烧录时自动记录（最多 8 个），搜索框下方给出随输入过滤的快捷按钮，型号列表把历史置顶并标注「· 最近」，工作台也能一键切回；随配置持久化，旧配置自动以当前已选型号作为首条历史
 - HEX / ELF / BIN 固件解析（地址区间、记录数、SHA256），支持拖拽载入
@@ -31,7 +34,8 @@
 
 - Rust **1.95+**（egui / eframe 0.37 的 MSRV 为 1.95）
 - 支持 OpenGL 的桌面环境（egui / eframe 0.37 的 glow 后端，未启用 wgpu）
-- Windows：运行时加载 `C:/Windows/Fonts/Deng.ttf`（或 `msyh.ttc` / `simhei.ttf`）作为中文字体回退；egui 内置字体不含 CJK 字形
+- Windows：运行时加载 `C:/Windows/Fonts/Deng.ttf`（或 `msyh.ttc` / `simhei.ttf`）作为中文字体回退；egui 内置字体不含 CJK 字形。彩色 emoji 另需 `C:/Windows/Fonts/seguiemj.ttf`（或 `NotoColorEmoji.ttf` / `seguisym.ttf`），缺失时降级为单色轮廓
+- **彩色 emoji 依赖 epaint 的 `color_fonts` feature**：egui/eframe 0.37 并不转发该 feature，因此 `Cargo.toml` 里直接依赖了 `epaint` 并开启它，Cargo 会把 feature 合并到同一个 epaint 实例。去掉这行会退回单色 emoji
 - 构建需能访问 crates.io 与 github.com；如网络受限，参见 `.cargo/config.example.toml`
 
 ## 构建与运行
@@ -208,12 +212,16 @@ probe-rs-studio.exe --load MYCHIP.FLM --chip MYCHIP_A --load-address 0x20000400 
 | 分组 | 内容 |
 | --- | --- |
 | 串口设置（左栏） | 在线端口下拉、波特率（可手填，常用值下拉）、数据位 5–8、停止位 1 / 1.5 / 2、校验位 无 / 奇 / 偶 / Mark / Space、流控 无 / XON-XOFF / RTS-CTS、「打开串口 / 关闭串口」、在线端口列表与端口详情 |
-| 串口会话（右栏） | 顶部信息条（端口、参数、RX / TX 累计字节数）、清空接收、接收区、发送区 |
+| 串口会话（右栏） | 顶部信息条（端口、参数、RX / TX 累计字节数）、清空接收、接收区、发送区、定时发送、快捷输入条 |
 
 - 默认 `115200 8N1`；参数随 `probe-rs-studio.json` 持久化，**打开期间参数被锁定**，
   要改参数先关闭串口。端口以独占方式 `CreateFileW` 打开，被其它程序占用会明确报错
 - 后台线程用 `mpsc` 收发命令：`COMMTIMEOUTS` 设成非阻塞读，8 ms 轮询输入队列，
   收到数据发 `Event::SerialRx` 给 UI，窗口空闲时也按 50 ms 持续重绘，不会漏显或卡住
+- **读取不再依赖 `COMSTAT.cbInQue`**：部分 USB CDC / 虚拟串口驱动只有在真正调用
+  `ReadFile` 时才把已到达的字节搬进输入队列，`cbInQue` 可能一直是 0。旧实现用它做门控，
+  导致 TX/RX 短接也完全收不到数据。现在每轮先 `ClearCommError` 清掉锁存错误，
+  再无条件非阻塞 `ReadFile(4096)`，超时仍保证立即返回
 - 接收区支持 **文本 / HEX + ASCII 显示**、自动滚动、清空；缓冲是 64 KiB 的滚动窗口，
   长时间收发不会无限增长
 - 发送区支持**文本**或 **HEX**（如 `41 54 0D 0A`，忽略空格 / `0x` 前缀 / 分隔符）、
@@ -223,9 +231,47 @@ probe-rs-studio.exe --load MYCHIP.FLM --chip MYCHIP_A --load-address 0x20000400 
 - 收发全程纯 Rust Win32 FFI（`GetCommState` / `SetCommState` / `ReadFile` / `WriteFile`），
   不依赖 `serialport` 等第三方 crate
 
-真机验证（DAPLink 虚拟串口 `COM10`，115200 8N1）：打开成功；发送 `Hello`（勾选追加 CRLF）
-→ TX 7 字节，日志 `48 65 6C 6C 6F 0D 0A`；切换 HEX 发送 `41 54 0D 0A` → TX 累计 11 字节，
-日志 `41 54 0D 0A`。RX 回显需要目标板实际向串口发数据或做 TX/RX 短接，本机未接回环设备。
+#### 定时发送
+
+发送区第二行勾选「定时发送」并填写周期（**100 – 3 600 000 ms**，默认 1000 ms）：
+串口打开后按周期自动重发当前发送框内容，右侧显示「已发 N 次」。周期非法会红字提示且不发送；
+关闭串口、串口被拔出或会话通道断开都会立即停发。定时发送的每帧不写 DEBUG 日志（避免刷屏），
+但 RX/TX 计数与累计次数照常更新。**启用状态不持久化**，重启后默认关闭，避免无人值守时自己发数据。
+
+#### 彩色 emoji 快捷输入
+
+点发送区右上角「快捷输入 😀」展开可横向滚动的快捷条：28 个常用 emoji + `AT` /
+`AT+GMR` / `AT+RST` / `CRLF` / `00 FF`。点一下就把字符插到**光标位置**（用 egui 的
+`TextEditOutput.cursor_range`，按字符而非字节索引）；不点发送框时默认追加到末尾。
+emoji 是真正的 UTF-8 字符，发送出来是 4 字节的 `F0 9F 98 80` 之类，用 HEX 显示可直接看到。
+
+egui 0.37 的彩色字形光栅化由 epaint 的 **`color_fonts`** feature 提供（COLR / CBDT / sbix，
+内部走 `vello_cpu`），而这个 feature **没有被 egui/eframe 转发**，所以 `Cargo.toml` 直接依赖
+`epaint` 来开启它。字体方面 `theme::install_fonts` 把系统 `seguiemj.ttf` 注册为
+Proportional / Monospace 的 fallback，并**放在 CJK 字体之前**，避免中文字体里的单色符号抢先命中。
+
+#### Ctrl + 滚轮缩放
+
+鼠标悬停在接收区或发送区上按住 Ctrl 滚滚轮（或触控板捏合），**只缩放该区**的文字，
+范围 **8 – 32 pt**，步长由 egui 的 `zoom_delta()` 经 `log2` 映射，放大 / 缩小对称。
+标题栏实时显示当前字号，两个字号分别写入 `probe-rs-studio.json`，重启后保留。
+HEX 模式的行高也随字号一起变，不会出现行重叠。
+
+#### 真机验证
+
+DAPLink 虚拟串口 `COM10`（`c251:f001`，`MI_00`），**TX/RX 已短接**，115200 8N1：
+
+| 场景 | 结果 |
+| --- | --- |
+| `--loopback COM10` | `[PASS]` 发 `Hello\r\n`，8 ms 后收到 `48 65 6C 6C 6F 0D 0A` |
+| GUI 文本发送 `Hello`（追加 CRLF） | TX 7 字节，DEBUG `48 65 6C 6C 6F 0D 0A` |
+| GUI HEX 发送 `41 54 0D 0A` | TX 累计 11 字节，DEBUG `41 54 0D 0A` |
+| 快捷输入插入 4 个 emoji 并发送 | TX / RX 同步增长，接收区显示彩色 emoji |
+| 定时发送持续运行 | RX/TX 从 18 → 396 字节同步增长，接收区回显彩色 emoji |
+| Ctrl+滚轮 | 接收区 11.5 → 17.8 → 32.0 pt，发送区独立保持 13.0 pt（可单独缩放） |
+
+排查接线与驱动问题时先跑 `--loopback`：它走的是 GUI 同一套 `Port::read/write` 代码，
+能一眼区分「线没接好 / 端口选错」和「GUI 显示问题」。
 
 ## 最近确认的型号
 
@@ -261,7 +307,12 @@ probe-rs-studio.exe --load <厂商.FLM> --chip <型号> --core M4
 # 列出当前在线串口（含调试器虚拟串口），无需硬件连接
 probe-rs-studio.exe --ports
 
-# 单元测试（hex 查看器、pack 转换、串口枚举 / 参数 / HEX 解析、矢量图标、主题配色、热插拔 diff、Registry 解析）
+# TX/RX 短接后做回环自检：走 GUI 同一套 Port::read/write，打印驱动队列与收到的字节
+probe-rs-studio.exe --loopback COM10
+probe-rs-studio.exe --loopback COM10 --baud 9600 --text "AT\r\n"
+
+# 单元测试（hex 查看器、pack 转换、串口枚举 / 参数 / HEX 解析、定时发送、缩放、快捷输入、
+# 矢量图标、主题配色、热插拔 diff、Registry 解析）
 cargo test --release --bin probe-rs-studio
 ```
 
@@ -272,8 +323,8 @@ cargo test --release --bin probe-rs-studio
 - 探针：DAPLink `c251:f001`，序列号 `LU_2022_8888`，CMSIS-DAP v1 HID（64 字节报告）
 - 目标：PY32F003x8（Armv6-M，64KB Flash / 8KB RAM）
 - 结果：烧录约 2.54 秒，库内校验 + 独立读回 SHA256 一致 + 复位成功
-- DAPLink 虚拟串口 `COM10`（`c251:f001`，`MI_00`）：识别为「调试器虚拟串口」；串口终端
-  115200 8N1 打开成功，文本 / HEX 发送与 TX 计数、DEBUG 字节日志均已验证
+- DAPLink 虚拟串口 `COM10`（`c251:f001`，`MI_00`）：识别为「调试器虚拟串口」；**TX/RX 短接回环**
+  115200 8N1 下文本 / HEX / 彩色 emoji 发送与接收、定时发送、Ctrl+滚轮缩放全部验证通过
 - Holychip HC32F4XX：已完成芯片描述解析与 Flash 算法完整性验证（单元测试覆盖 3 个型号、
   指令 blob、入口偏移、NVM/RAM 区间）。本机暂无该系列硬件，**未做真机烧录验证**。
 
@@ -282,13 +333,13 @@ cargo test --release --bin probe-rs-studio
 ## 目录结构
 
 ```
-src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports 分派
-src/app.rs        会话侧栏、16 进制查看器、串口终端 UI、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
+src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback 分派
+src/app.rs        会话侧栏、16 进制查看器、串口终端（定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
 src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、探针与串口监视、串口会话线程、芯片描述导入
 src/pack.rs       CMSIS-Pack 转换器：ZIP / pdsc XML / ELF32 FLM / target YAML（纯 Rust）
 src/firmware.rs   HEX / ELF / BIN 解析与 SHA256
-src/serial.rs     纯 Rust Win32 FFI 串口枚举、线路参数、独占打开与非阻塞收发
-src/theme.rs      深浅两套配色、CJK 字体安装
+src/serial.rs     纯 Rust Win32 FFI 串口枚举、线路参数、独占打开、非阻塞收发与队列诊断
+src/theme.rs      深浅两套配色、CJK 与彩色 emoji 系统字体 fallback（emoji 排在 CJK 之前）
 src/icons.rs      SVG 子集解析 + epaint 矢量绘制
 assets/icons/     6 个 SVG 图标 + Windows 任务栏图标 RGBA
 targets/          CMSIS-Pack 转换出的扩展芯片描述 YAML

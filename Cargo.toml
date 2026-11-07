@@ -7,6 +7,10 @@ description = "A DSH-style desktop flashing workbench built directly on the prob
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.37"
+# egui 0.37 can rasterise COLR/CBDT colour emoji, but the feature lives on
+# epaint and is NOT re-exported by egui/eframe. Enabling it directly on the
+# same epaint package instance turns the system emoji font into real colour.
+epaint = { version = "0.37", features = ["color_fonts"] }
 # Maintained fork: the daplink-hid-fallback branch carries the CMSIS-DAP v1
 # HID packet-size fallback required by DAPLink clones that never answer
 # DAP_Info(PacketSize). See README for the local path-override workflow.

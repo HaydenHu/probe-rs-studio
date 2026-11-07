@@ -132,35 +132,60 @@ pub fn apply(ctx: &Context, mode: ThemeMode) {
     ctx.set_visuals(v);
 }
 
-/// egui's built-in fonts contain no CJK glyphs. Append a Windows system font
-/// as a fallback so Chinese labels never render as tofu boxes.
+/// Register a font file in both text families. When `before_cjk` is set the
+/// font is inserted ahead of the CJK fallback, so a colour emoji font wins
+/// over any monochrome symbol glyphs the CJK font may also contain.
+fn add_font(
+    fonts: &mut egui::FontDefinitions,
+    name: &str,
+    bytes: Vec<u8>,
+    before_cjk: bool,
+) {
+    fonts.font_data.insert(
+        name.to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let list = fonts.families.entry(family).or_default();
+        if before_cjk {
+            let at = list
+                .iter()
+                .position(|n| n == "system-cjk")
+                .unwrap_or(list.len());
+            list.insert(at, name.to_owned());
+        } else {
+            list.push(name.to_owned());
+        }
+    }
+}
+
+/// egui's built-in fonts contain no CJK glyphs, and its colour-emoji support
+/// (epaint `color_fonts`) needs a COLR/CBDT font such as Segoe UI Emoji.
+/// Both are registered as system fallbacks, with emoji ahead of CJK so
+/// pictographs render in colour instead of as a monochrome outline.
 pub fn install_fonts(ctx: &Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let candidates = [
+    for path in [
         "C:/Windows/Fonts/Deng.ttf",
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simhei.ttf",
         "C:/Windows/Fonts/NotoSansSC-VF.ttf",
-    ];
-    for path in candidates {
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
-        };
-        let name = "system-cjk".to_owned();
-        fonts
-            .font_data
-            .insert(name.clone(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .push(name.clone());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .push(name);
-        break;
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            add_font(&mut fonts, "system-cjk", bytes, false);
+            break;
+        }
+    }
+    for path in [
+        "C:/Windows/Fonts/seguiemj.ttf",
+        "C:/Windows/Fonts/NotoColorEmoji.ttf",
+        "C:/Windows/Fonts/seguisym.ttf",
+        "C:/Windows/Fonts/NotoEmoji-Regular.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            add_font(&mut fonts, "system-emoji", bytes, true);
+            break;
+        }
     }
     ctx.set_fonts(fonts);
 }

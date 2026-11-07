@@ -419,6 +419,19 @@ impl Port {
             anyhow::bail!("串口 I/O 仅支持 Windows")
         }
     }
+
+    /// Driver-side snapshot for diagnostics: (latched errors, cbInQue,
+    /// cbOutQue). `ClearCommError` also clears the latched error bits.
+    pub fn queue_status(&self) -> anyhow::Result<(u32, u32, u32)> {
+        #[cfg(windows)]
+        {
+            windows::queue_status(self.handle).map_err(anyhow::Error::msg)
+        }
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!("串口 I/O 仅支持 Windows")
+        }
+    }
 }
 
 pub fn open_port(name: &str, cfg: SerialSettings) -> anyhow::Result<Port> {
@@ -903,23 +916,38 @@ mod windows {
         Ok(handle)
     }
 
-    pub(super) fn read_raw(handle: Handle) -> Result<Vec<u8>, String> {
+    /// Snapshot the driver queues and clear latched error bits.
+    pub(super) fn queue_status(handle: Handle) -> Result<(u32, u32, u32), String> {
         let mut errors = 0u32;
         let mut stat: ComStat = unsafe { std::mem::zeroed() };
         if unsafe { ClearCommError(handle, &mut errors, &mut stat) } == 0 {
             return Err(last_error("ClearCommError"));
         }
-        let queued = stat.cb_in_que.min(4096);
-        if queued == 0 {
-            return Ok(Vec::new());
-        }
-        let mut buf = vec![0u8; queued as usize];
+        Ok((errors, stat.cb_in_que, stat.cb_out_que))
+    }
+
+    /// Non-blocking read. With the MAXDWORD/0/0 timeouts installed by
+    /// `open_raw`, `ReadFile` returns immediately with whatever the driver has
+    /// already queued (possibly zero bytes) and never waits.
+    ///
+    /// Do **not** gate this on `COMSTAT.cbInQue`: several USB CDC / virtual
+    /// COM drivers only pull bytes up from the device when a read is actually
+    /// issued, so `cbInQue` can still be 0 for data that has already arrived.
+    /// That made a TX/RX loopback look completely silent even though the wire
+    /// was fine. `ClearCommError` is still called first to clear latched
+    /// framing/overrun errors, otherwise the driver can stop delivering data.
+    pub(super) fn read_raw(handle: Handle) -> Result<Vec<u8>, String> {
+        // Clears latched framing/overrun errors; the driver may otherwise stop
+        // delivering data after a single glitch.
+        let _ = queue_status(handle)?;
+        const CHUNK: usize = 4096;
+        let mut buf = vec![0u8; CHUNK];
         let mut read = 0u32;
         let ok = unsafe {
             ReadFile(
                 handle,
                 buf.as_mut_ptr(),
-                queued,
+                CHUNK as u32,
                 &mut read,
                 std::ptr::null_mut(),
             )
@@ -1129,5 +1157,22 @@ mod tests {
         assert!(open_port("COM7", SerialSettings { baud: 0, ..Default::default() }).is_err());
         #[cfg(windows)]
         assert!(open_port("COM98765", SerialSettings::default()).is_err());
+    }
+
+    /// Regression guard for the silent-RX bug: the read must not be skipped
+    /// when `COMSTAT.cbInQue` is zero. Several USB CDC drivers only surface
+    /// arrived bytes to `ReadFile`, so gating on the queue counter made a
+    /// TX/RX loopback look dead even though the wire was fine.
+    #[test]
+    fn reads_are_not_gated_on_the_driver_queue_counter() {
+        let source = include_str!("serial.rs");
+        // Split the needle so this assertion does not match itself.
+        assert!(
+            !source.contains(concat!("if queued ", "== 0")),
+            "read is gated on cbInQue again"
+        );
+        assert!(source.contains("let _ = queue_status(handle)?;"));
+        assert!(source.contains("CHUNK as u32"));
+        assert!(source.contains("queue_status"));
     }
 }

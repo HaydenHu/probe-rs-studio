@@ -109,6 +109,29 @@ fn main() -> eframe::Result<()> {
         std::process::exit(0);
     }
 
+    // Headless TX/RX loopback check: --loopback <COMx> [--baud N] [--text ...]
+    // Uses the very same Port/read/write path as the GUI serial terminal, so
+    // it separates "wire/driver is fine" from "GUI wiring is broken".
+    if let Some(pos) = args.iter().position(|a| a == "--loopback") {
+        let Some(name) = args.get(pos + 1) else {
+            eprintln!("用法: probe-rs-studio.exe --loopback <COMx> [--baud N] [--text 内容]");
+            std::process::exit(2);
+        };
+        let baud = cli_opt(&args, "--baud")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(115200);
+        let text = cli_opt(&args, "--text")
+            .unwrap_or_else(|| "Hello\\r\\n".to_owned())
+            .replace("\\r", "\r")
+            .replace("\\n", "\n")
+            .replace("\\0", "\0");
+        let cfg = serial::SerialSettings {
+            baud,
+            ..Default::default()
+        };
+        std::process::exit(serial_loopback(name, cfg, text.as_bytes()));
+    }
+
     // Headless CMSIS-Pack conversion: probe-rs-studio.exe --load|--pack <file> [--out <yaml>]
     if let Some(pos) = args.iter().position(|a| a == "--pack") {
         let Some(file) = args.get(pos + 1) else {
@@ -215,6 +238,70 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
+}
+
+/// `--loopback <COMx>`: write a short payload and read it back through the
+/// real serial I/O path. Short the port's TX and RX pins before running this.
+fn serial_loopback(name: &str, cfg: serial::SerialSettings, payload: &[u8]) -> i32 {
+    use std::time::{Duration, Instant};
+    println!("回环自检: {name} · {} · {} 字节", cfg.label(), payload.len());
+    let port = match serial::open_port(name, cfg) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("打开失败: {err:#}");
+            return 1;
+        }
+    };
+    println!("打开成功 · 初始队列 {:?}", port.queue_status());
+    match port.write(payload) {
+        Ok(n) => println!("TX {n} 字节: {payload:02X?}"),
+        Err(err) => {
+            eprintln!("写入失败: {err:#}");
+            return 1;
+        }
+    }
+    let mut rx = Vec::new();
+    let started = Instant::now();
+    let mut polls = 0u32;
+    let mut max_queued = 0u32;
+    while started.elapsed() < Duration::from_millis(1500) {
+        polls += 1;
+        if let Ok((_, in_que, _)) = port.queue_status() {
+            max_queued = max_queued.max(in_que);
+        }
+        match port.read() {
+            Ok(bytes) if !bytes.is_empty() => {
+                println!(
+                    "  +{:>4}ms  RX {} 字节 {bytes:02X?}",
+                    started.elapsed().as_millis(),
+                    bytes.len()
+                );
+                rx.extend_from_slice(&bytes);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("读取失败: {err:#}");
+                return 1;
+            }
+        }
+        if rx.len() >= payload.len() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    println!(
+        "轮询 {polls} 次 · 驱动最大 cbInQue={max_queued} · 共收到 {} 字节: {:?}",
+        rx.len(),
+        String::from_utf8_lossy(&rx)
+    );
+    println!("末次队列 {:?}", port.queue_status());
+    if rx == payload {
+        println!("[PASS] 回环数据与发送内容一致");
+        0
+    } else {
+        println!("[FAIL] 未收到完整回环数据（检查 TX/RX 短接、所选端口与波特率）");
+        1
+    }
 }
 
 /// Fetch a `--key value` pair from the argument list.
