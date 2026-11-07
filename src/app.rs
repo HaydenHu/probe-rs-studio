@@ -23,6 +23,7 @@ use crate::{
     },
     firmware::{self, FirmwareFormat, FirmwareInfo},
     icons::{IconKind, IconSet},
+    option_bytes::{self, ObImage, ObSnapshot},
     pack::{self, FlmSpec},
     serial::{self, SerialPort, SerialSettings},
     theme::{self, Palette, ThemeMode},
@@ -410,6 +411,16 @@ impl FlmForm {
     }
 }
 
+/// Deferred actions from the option-byte dialog; applied after the egui
+/// closure releases its borrow of `self`.
+enum ObAction {
+    None,
+    Read(u64),
+    Write(ObImage, u64),
+    Reset,
+    Copy(String),
+}
+
 pub struct App {
     icons: IconSet,
     cfg: FlashConfig,
@@ -483,6 +494,16 @@ pub struct App {
     last_saved: String,
     /// `Some` while the standalone .FLM import dialog is open.
     flm_form: Option<FlmForm>,
+    /// Option-byte editor. Deliberately NOT persisted: a restart must never
+    /// re-arm a pending OB write or silently restore an edited image.
+    ob_open: bool,
+    ob_snapshot: Option<ObSnapshot>,
+    ob_edit: Option<ObImage>,
+    ob_raw_hex: String,
+    ob_raw_error: Option<String>,
+    ob_base_text: String,
+    ob_acknowledge: bool,
+    ob_armed: bool,
 }
 
 /// How many recently confirmed chip models are kept in the settings file.
@@ -648,6 +669,19 @@ impl App {
             config_path: path,
             last_saved: String::new(),
             flm_form: None,
+            // `--ob-open` starts straight into the option-byte editor; handy
+            // for quickly inspecting a freshly connected board.
+            ob_open: std::env::args().any(|a| a == "--ob-open"),
+            ob_snapshot: None,
+            ob_edit: None,
+            ob_raw_hex: String::new(),
+            ob_raw_error: None,
+            ob_base_text: format!(
+                "0x{:08X}",
+                option_bytes::profile_for_chip(&seeded_chip).base
+            ),
+            ob_acknowledge: false,
+            ob_armed: false,
         };
         app.push_log(Level::Info, "ProbeRS Studio 已启动 · 直接链接 probe-rs 库");
         app.push_log(Level::Debug, format!("配置文件: {}", app.config_path.display()));
@@ -761,6 +795,7 @@ impl App {
                         }
                     }
                 }
+                Event::OptionBytes(snapshot) => self.on_option_bytes(snapshot),
                 Event::Connected(text) => self.connection = Some(text),
                 Event::Progress { value, label } => {
                     self.progress = value;
@@ -1167,6 +1202,13 @@ impl App {
                         if Self::ghost_button(ui, p, "芯片库", true).clicked() {
                             self.nav = Nav::Chips;
                         }
+                        if Self::ghost_button(ui, p, "选项字节", true).clicked() {
+                            self.ob_open = true;
+                            if self.ob_snapshot.is_none() {
+                                let base = option_bytes::profile_for_chip(&self.cfg.chip).base;
+                                self.ob_base_text = format!("0x{base:08X}");
+                            }
+                        }
                         let log_label = if self.log_panel_open { "隐藏日志" } else { "显示日志" };
                         if Self::ghost_button(ui, p, log_label, true).clicked() {
                             self.log_panel_open = !self.log_panel_open;
@@ -1518,6 +1560,29 @@ impl App {
                 egui::TextEdit::singleline(&mut self.size_text),
             );
         });
+        ui.add_space(6.0);
+        if Self::sidebar_button(
+            ui,
+            p,
+            if self.ob_open {
+                "选项字节设置（已打开）"
+            } else {
+                "选项字节设置…"
+            },
+            true,
+            false,
+            ui.available_width(),
+        )
+        .on_hover_text("读取 / 编辑芯片的读保护、BOR、看门狗、启动与写保护配置")
+        .clicked()
+        {
+            self.ob_open = true;
+            // Follow the currently selected chip unless the user edited the base.
+            if self.ob_snapshot.is_none() {
+                let base = option_bytes::profile_for_chip(&self.cfg.chip).base;
+                self.ob_base_text = format!("0x{base:08X}");
+            }
+        }
         ui.horizontal(|ui| {
             let path = self.cfg.backup_path.display().to_string();
             ui.label(RichText::new(path).size(9.0).color(p.text3))
@@ -2378,6 +2443,399 @@ impl App {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Option-byte editor
+    // ---------------------------------------------------------------------
+
+    /// A fresh read resets every pending write state. Nothing about OB editing
+    /// is persisted, so a restart can never leave a write armed.
+    fn on_option_bytes(&mut self, snapshot: ObSnapshot) {
+        let Some(image) = ObImage::from_slice(&snapshot.bytes) else {
+            self.push_log(
+                Level::Error,
+                format!("选项字节长度异常：{} 字节", snapshot.bytes.len()),
+            );
+            return;
+        };
+        self.ob_raw_hex = image.hex();
+        self.ob_raw_error = None;
+        self.ob_edit = Some(image);
+        self.ob_snapshot = Some(snapshot);
+        self.ob_acknowledge = false;
+        self.ob_armed = false;
+        self.ob_open = true;
+        self.push_log(Level::Ok, format!("已读取选项字节: {}", image.hex()));
+    }
+
+    fn draw_option_bytes_dialog(&mut self, ctx: &egui::Context, p: Palette) {
+        if !self.ob_open {
+            return;
+        }
+        let chip = self.cfg.chip.clone();
+        let profile = option_bytes::profile_for_chip(&chip);
+        let can_run = self.can_run();
+        let snapshot = self.ob_snapshot.clone();
+        let mut image = self
+            .ob_edit
+            .unwrap_or_else(ObImage::factory_default);
+        let mut base_text = self.ob_base_text.clone();
+        let mut raw_hex = self.ob_raw_hex.clone();
+        if raw_hex.trim().is_empty() {
+            // First open (before any read): keep the HEX box in sync with the
+            // baseline image instead of showing an empty editor.
+            raw_hex = image.hex();
+        }
+        let mut raw_error = self.ob_raw_error.clone();
+        let mut ack = self.ob_acknowledge;
+        let mut armed = self.ob_armed;
+        let mut open = true;
+        let mut action = ObAction::None;
+
+        egui::Window::new("选项字节设置")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(660.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("{} · {}", chip, profile.label))
+                        .size(15.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.label(RichText::new(profile.note).size(10.0).color(p.text3));
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("OB 基址").size(11.0).color(p.text2));
+                    ui.add_sized(
+                        [150.0, 24.0],
+                        egui::TextEdit::singleline(&mut base_text),
+                    );
+                    if ui
+                        .add_enabled(can_run, egui::Button::new("读取当前值"))
+                        .on_hover_text("只读，不改动芯片；按当前选中的探针与芯片连接一次")
+                        .clicked()
+                    {
+                        if let Some(base) = option_bytes::parse_base(&base_text) {
+                            action = ObAction::Read(base);
+                        }
+                    }
+                });
+                if !profile.writable {
+                    ui.label(
+                        RichText::new("该芯片未内置匹配的 OPT.FLM：可读取、编辑并复制，但不能写入")
+                            .size(10.0)
+                            .color(p.warn),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.separator();
+
+                // Raw block: what the chip has now vs. what would be written.
+                if let Some(snap) = &snapshot {
+                    if let Some(old) = ObImage::from_slice(&snap.bytes) {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("当前").size(10.0).color(p.text3));
+                            ui.label(
+                                RichText::new(old.hex())
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(p.text2),
+                            );
+                        });
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("尚未读取芯片 · 显示的是无保护参考值，请先点「读取当前值」")
+                            .size(10.0)
+                            .color(p.warn),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("目标").size(10.0).color(p.text3));
+                    ui.label(
+                        RichText::new(image.hex())
+                            .monospace()
+                            .size(11.0)
+                            .color(p.accent),
+                    );
+                });
+                let ok = image.complements_valid();
+                ui.label(
+                    RichText::new(if ok {
+                        "反码与保留字节校验通过"
+                    } else {
+                        "反码/保留字节校验未通过：写入前需点「补全反码」"
+                    })
+                    .size(10.0)
+                    .color(if ok { p.success } else { p.warn }),
+                );
+                ui.add_space(4.0);
+                ui.separator();
+
+                let fields = option_bytes::fields_for(profile.kind);
+                if fields.is_empty() {
+                    ui.label(
+                        RichText::new("该芯片没有已核对的字段布局，请用下方原始 HEX 编辑")
+                            .size(11.0)
+                            .color(p.text2),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("ob_field_scroll")
+                        .max_height(238.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("ob_field_grid")
+                                .num_columns(2)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    for def in fields {
+                                        ui.label(
+                                            RichText::new(def.label)
+                                                .size(11.0)
+                                                .color(if def.danger {
+                                                    p.warn
+                                                } else {
+                                                    p.text2
+                                                }),
+                                        )
+                                        .on_hover_text(def.help);
+                                        let before =
+                                            option_bytes::read_field(&image, def);
+                                        let mut value = before;
+                                        if !def.choices.is_empty() {
+                                            egui::ComboBox::from_id_salt(def.id)
+                                                .selected_text(
+                                                    option_bytes::format_value(def, value),
+                                                )
+                                                .width(250.0)
+                                                .show_ui(ui, |ui| {
+                                                    for choice in def.choices {
+                                                        ui.selectable_value(
+                                                            &mut value,
+                                                            choice.value,
+                                                            choice.label,
+                                                        );
+                                                    }
+                                                });
+                                        } else {
+                                            let mask = if def.width >= 32 {
+                                                u32::MAX
+                                            } else {
+                                                (1u32 << def.width) - 1
+                                            };
+                                            let mut drag = egui::DragValue::new(&mut value)
+                                                .range(0u32..=mask)
+                                                .speed(1.0);
+                                            if def.width > 8 {
+                                                drag = drag.hexadecimal(
+                                                    (def.width as usize + 3) / 4,
+                                                    false,
+                                                    true,
+                                                );
+                                            }
+                                            ui.add(drag);
+                                        }
+                                        if value != before
+                                            && option_bytes::write_field(&mut image, def, value)
+                                                .is_ok()
+                                        {
+                                            // Field edits always keep complements valid.
+                                            raw_hex = image.hex();
+                                            raw_error = None;
+                                            armed = false;
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+                ui.add_space(4.0);
+                ui.separator();
+
+                ui.label(
+                    RichText::new("原始 16 字节 HEX（可直接编辑 / 复制）")
+                        .size(10.0)
+                        .color(p.text3),
+                );
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [(ui.available_width() - 168.0).max(180.0), 24.0],
+                        egui::TextEdit::singleline(&mut raw_hex),
+                    );
+                    if ui.button("应用").clicked() {
+                        match option_bytes::parse_hex_image(&raw_hex) {
+                            Ok(parsed) => {
+                                image = parsed;
+                                raw_error = None;
+                                armed = false;
+                            }
+                            Err(err) => raw_error = Some(err),
+                        }
+                    }
+                    if ui
+                        .button("补全反码")
+                        .on_hover_text("按当前配置字节重算全部反码，并把保留字节置为 0xFF")
+                        .clicked()
+                    {
+                        image.refresh_complements();
+                        raw_hex = image.hex();
+                        raw_error = None;
+                        armed = false;
+                    }
+                });
+                if let Some(err) = &raw_error {
+                    ui.label(RichText::new(err).size(10.0).color(p.error));
+                }
+
+                // Change list drives the confirmation copy.
+                let changes = snapshot
+                    .as_ref()
+                    .and_then(|s| ObImage::from_slice(&s.bytes))
+                    .map(|old| option_bytes::diff(profile.kind, &old, &image))
+                    .unwrap_or_default();
+                ui.add_space(4.0);
+                if snapshot.is_none() {
+                    ui.label(
+                        RichText::new("尚未读取芯片 · 请先点「读取当前值」，再修改并写入")
+                            .size(10.0)
+                            .color(p.warn),
+                    );
+                } else if changes.is_empty() {
+                    ui.label(
+                        RichText::new("目标与当前值一致，没有待写入的变更")
+                            .size(10.0)
+                            .color(p.text3),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!("待写入 {} 项变更：", changes.len()))
+                            .size(10.0)
+                            .color(p.text2),
+                    );
+                    for change in &changes {
+                        ui.label(
+                            RichText::new(format!(
+                                "  {} · {} → {}{}",
+                                change.label,
+                                change.from,
+                                change.to,
+                                if change.danger { "  ⚠ 高风险" } else { "" }
+                            ))
+                            .size(10.0)
+                            .color(if change.danger { p.warn } else { p.text2 }),
+                        );
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "⚠ 写入会改动读保护、启动模式、复位脚与写保护配置。错误的 RDP / BOOT / NRST 设置\n\
+                         可能让芯片无法通过 SWD 再次连接；恢复通常需要整片擦除（会清除用户 Flash）。\n\
+                         写入后请给目标板重新上电，选项字节才会完全生效。",
+                    )
+                    .size(10.0)
+                    .color(p.warn),
+                );
+                ui.checkbox(&mut ack, "我已了解风险，确认要改写芯片配置");
+                ui.add_space(4.0);
+                let write_ready = profile.writable
+                    && can_run
+                    && snapshot.is_some()
+                    && !changes.is_empty()
+                    && ack
+                    && image.complements_valid();
+                ui.horizontal(|ui| {
+                    if ui.button("恢复为当前值").clicked() {
+                        action = ObAction::Reset;
+                    }
+                    if ui
+                        .button("复制目标 HEX")
+                        .on_hover_text("复制到剪贴板，便于粘贴到其它烧录工具")
+                        .clicked()
+                    {
+                        action = ObAction::Copy(image.hex());
+                    }
+                    let label = if armed { "再次点击以确认写入" } else { "写入选项字节" };
+                    if ui
+                        .add_enabled(write_ready, egui::Button::new(label))
+                        .on_hover_text("需要二次点击确认；只写 16 字节 OB 区，不动用户 Flash 内容")
+                        .clicked()
+                    {
+                        if armed {
+                            if let Some(base) = option_bytes::parse_base(&base_text) {
+                                action = ObAction::Write(image, base);
+                            }
+                            armed = false;
+                        } else {
+                            armed = true;
+                        }
+                    }
+                });
+            });
+
+        // Fold local edits back into the app. Taking this after `show` avoids
+        // borrowing `self` from inside the egui closure.
+        self.ob_edit = Some(image);
+        self.ob_base_text = base_text;
+        self.ob_raw_hex = raw_hex;
+        self.ob_raw_error = raw_error;
+        self.ob_acknowledge = ack;
+        self.ob_armed = armed;
+        if !open {
+            self.ob_open = false;
+            return;
+        }
+        match action {
+            ObAction::None => {}
+            ObAction::Read(base) => {
+                self.push_log(Level::Info, format!("读取选项字节 0x{base:08X} …"));
+                self.start_job(
+                    Job::ReadOptionBytes {
+                        cfg: Box::new(self.cfg.clone()),
+                        base,
+                    },
+                    "读取选项字节",
+                );
+            }
+            ObAction::Write(image, base) => {
+                self.push_log(
+                    Level::Warn,
+                    format!("二次确认通过 · 准备写入选项字节 0x{base:08X}: {}", image.hex()),
+                );
+                self.start_job(
+                    Job::WriteOptionBytes {
+                        cfg: Box::new(self.cfg.clone()),
+                        base,
+                        image,
+                        acknowledged: self.ob_acknowledge,
+                    },
+                    "写入选项字节",
+                );
+            }
+            ObAction::Reset => {
+                if let Some(old) = self
+                    .ob_snapshot
+                    .as_ref()
+                    .and_then(|s| ObImage::from_slice(&s.bytes))
+                {
+                    self.ob_edit = Some(old);
+                    self.ob_raw_hex = old.hex();
+                    self.ob_raw_error = None;
+                    self.ob_armed = false;
+                    self.ob_acknowledge = false;
+                    self.push_log(Level::Info, "已恢复为芯片当前选项字节");
+                }
+            }
+            ObAction::Copy(text) => {
+                ctx.copy_text(text);
+                self.push_log(Level::Info, "目标选项字节 HEX 已复制到剪贴板");
+            }
+        }
+    }
+
     fn export_logs(&mut self) {
         let Some(path) = with_all_files(
             rfd::FileDialog::new().add_filter("日志", &["txt", "log"]),
@@ -3143,6 +3601,7 @@ impl eframe::App for App {
         self.draw_sidebar(root, p);
         self.draw_center(root, p);
         self.draw_flm_dialog(&ctx, p);
+        self.draw_option_bytes_dialog(&ctx, p);
         self.persist();
 
         // Keep egui's global Visuals (checkboxes, selectable labels, scroll
@@ -3720,5 +4179,49 @@ mod tests {
         }
         let theme = include_str!("theme.rs");
         assert!(theme.contains("seguiemj.ttf"), "emoji font fallback missing");
+    }
+
+    /// The OB editor must stay reachable from the workbench sidebar, driven by
+    /// the background jobs, and guarded by the risk acknowledgement.
+    #[test]
+    fn option_bytes_editor_is_wired_into_the_workbench() {
+        let app = include_str!("app.rs");
+        for needle in [
+            concat!("选项", "字节设置"),
+            "draw_option_bytes_dialog",
+            "Event::OptionBytes(snapshot)",
+            "Job::ReadOptionBytes",
+            "Job::WriteOptionBytes",
+            "ob_acknowledge",
+            "补全反码",
+            "on_option_bytes",
+        ] {
+            assert!(app.contains(needle), "missing OB editor wiring: {needle}");
+        }
+        let backend_src = include_str!("backend.rs");
+        assert!(backend_src.contains("option_bytes::validate"));
+        assert!(backend_src.contains("PY32_OPT_YAML"));
+        assert!(backend_src.contains("connect_with(cfg, tx, true)"));
+        let main = include_str!("main.rs");
+        assert!(main.contains("mod option_bytes;"));
+        assert!(main.contains("--option-bytes"));
+    }
+
+    /// A pending OB write must never survive a restart. All editor state is
+    /// runtime-only and therefore absent from the persisted Settings struct.
+    #[test]
+    fn option_bytes_write_state_is_never_persisted() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split("struct Settings {")
+            .nth(1)
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
+        for needle in ["ob_open", "ob_edit", "ob_armed", "ob_acknowledge"] {
+            assert!(!body.contains(needle), "OB state leaked into Settings: {needle}");
+        }
+        assert!(source.contains("self.ob_acknowledge = false;"));
     }
 }

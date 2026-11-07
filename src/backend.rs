@@ -28,6 +28,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     firmware::{self, FirmwareFormat, FirmwareInfo},
+    option_bytes::{self, ObImage, ObSnapshot, OB_IMAGE_LEN},
     pack::FlmSpec,
 };
 
@@ -137,6 +138,20 @@ pub enum Job {
     VerifyFirmware(Box<FlashConfig>),
     EraseAll(Box<FlashConfig>),
     Reset(Box<FlashConfig>),
+    /// Read the 16-byte option-byte block (read-only, safe on any chip).
+    ReadOptionBytes {
+        cfg: Box<FlashConfig>,
+        base: u64,
+    },
+    /// Program the option-byte block with the bundled OPT.FLM algorithm.
+    /// `acknowledged` mirrors the UI's "I understand the risk" checkbox and is
+    /// re-validated here so a stray job cannot bypass it.
+    WriteOptionBytes {
+        cfg: Box<FlashConfig>,
+        base: u64,
+        image: ObImage,
+        acknowledged: bool,
+    },
 }
 
 pub enum Event {
@@ -158,6 +173,8 @@ pub enum Event {
     SerialTxCount(usize),
     /// Session ended; the string is empty for a user-initiated close.
     SerialClosed(String),
+    /// A fresh read of the chip's option-byte block.
+    OptionBytes(ObSnapshot),
     Connected(String),
     Progress { value: f32, label: String },
     Finished { ok: bool, summary: String, elapsed: f32 },
@@ -299,6 +316,13 @@ fn run(job: Job, tx: &Sender<Event>) -> Result<String> {
             reset_target(&mut session, tx)?;
             Ok("目标已复位并运行".to_owned())
         }
+        Job::ReadOptionBytes { cfg, base } => read_option_bytes(&cfg, base, tx),
+        Job::WriteOptionBytes {
+            cfg,
+            base,
+            image,
+            acknowledged,
+        } => write_option_bytes(&cfg, base, image, acknowledged, tx),
     }
 }
 
@@ -935,6 +959,15 @@ fn chip_info(chip: &str, cfg: Option<&FlashConfig>, tx: &Sender<Event>) -> Resul
 }
 
 fn connect(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<Session> {
+    connect_with(cfg, tx, false)
+}
+
+/// `attach_ob` appends the bundled option-byte flash algorithm and its 16-byte
+/// NVM region to the selected target. probe-rs' `FlashLoader` is built from
+/// `session.target()`, so this is what makes an OB address programmable: the
+/// main Flash algorithm does not cover 0x1FFF0E80, but the vendor's dedicated
+/// `*_OPT.FLM` does. The extra algorithm lives only for this one session.
+fn connect_with(cfg: &FlashConfig, tx: &Sender<Event>, attach_ob: bool) -> Result<Session> {
     let lister = Lister::new();
     let probes = lister.list_all();
     // Prefer the stable device identity: enumeration indices shift whenever a
@@ -968,9 +1001,33 @@ fn connect(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<Session> {
     );
 
     let registry = build_registry(Some(cfg), tx)?;
-    let target = registry
+    let mut target = registry
         .get_target_by_name(&cfg.chip)
         .with_context(|| format!("芯片 {} 不在描述库中", cfg.chip))?;
+    if attach_ob {
+        // Keep the OPT family out of the general chip registry: resolve it in a
+        // private registry, then lift just the algorithm + NVM region over.
+        let mut ob_registry = Registry::from_builtin_families();
+        ob_registry
+            .add_target_family_from_yaml(option_bytes::PY32_OPT_YAML)
+            .context("内置 PY32 选项字节算法解析失败")?;
+        let ob_target = ob_registry
+            .get_target_by_name(option_bytes::PY32_OB_VARIANT)
+            .context("内置 PY32 选项字节算法缺少目标型号")?;
+        let algorithm = ob_target
+            .flash_algorithms
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("内置 PY32 选项字节算法为空"))?;
+        let region = ob_target
+            .memory_map
+            .into_iter()
+            .find(|r| r.as_nvm_region().is_some())
+            .ok_or_else(|| anyhow!("内置 PY32 选项字节算法缺少 NVM 区域"))?;
+        target.flash_algorithms.push(algorithm);
+        target.memory_map.push(region);
+        log(tx, Level::Info, "已挂载 PY32F0xx_OPT.FLM 选项字节算法");
+    }
     let selector = TargetSelector::Specified(Box::new(target));
     let permissions = Permissions::default();
     let session = if cfg.connect_under_reset {
@@ -1217,6 +1274,175 @@ fn flash(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<String> {
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Option bytes
+// ---------------------------------------------------------------------------
+
+/// Read the option-byte block through plain memory access. Safe on every chip:
+/// no FLASH registers are touched and nothing is written.
+fn read_ob_snapshot(cfg: &FlashConfig, base: u64, tx: &Sender<Event>) -> Result<ObSnapshot> {
+    let mut session = connect(cfg, tx)?;
+    let mut bytes = vec![0u8; OB_IMAGE_LEN];
+    {
+        let mut core = session.core(0).context("无法访问核心 0")?;
+        core.halt(Duration::from_millis(500)).ok();
+        core.read_8(base, &mut bytes)
+            .with_context(|| format!("读取选项字节 0x{base:08X} 失败"))?;
+        core.run().ok();
+    }
+    Ok(ObSnapshot {
+        chip: cfg.chip.clone(),
+        base,
+        bytes,
+    })
+}
+
+fn read_option_bytes(cfg: &FlashConfig, base: u64, tx: &Sender<Event>) -> Result<String> {
+    let snapshot = read_ob_snapshot(cfg, base, tx)?;
+    let image = ObImage::from_slice(&snapshot.bytes)
+        .ok_or_else(|| anyhow!("选项字节长度不是 {OB_IMAGE_LEN} 字节"))?;
+    log(
+        tx,
+        Level::Ok,
+        format!("读取 0x{base:08X}: {}", image.hex()),
+    );
+    if !image.complements_valid() {
+        log(
+            tx,
+            Level::Warn,
+            "选项字节反码/保留字节校验未通过，请以原始字节为准",
+        );
+    }
+    let _ = tx.send(Event::OptionBytes(snapshot));
+    Ok(format!("已读取 {OB_IMAGE_LEN} 字节选项字节"))
+}
+
+/// Program the 16-byte OB block with the vendor's dedicated OPT.FLM algorithm.
+/// The block is staged as a temporary BIN so probe-rs' own loader performs the
+/// erase/program/verify sequence; no FLASH controller registers are poked by
+/// hand. The current block is read first and every guard in
+/// `option_bytes::validate` is enforced before anything is written.
+fn write_option_bytes(
+    cfg: &FlashConfig,
+    base: u64,
+    image: ObImage,
+    acknowledged: bool,
+    tx: &Sender<Event>,
+) -> Result<String> {
+    let profile = option_bytes::profile_for_chip(&cfg.chip);
+    if !profile.writable {
+        bail!("{}\n该芯片未内置地址匹配的 OPT.FLM，暂不提供写入（只能读取与导出）", profile.note);
+    }
+    if base != profile.base {
+        bail!(
+            "OB 基址 0x{base:08X} 与内置算法地址 0x{:08X} 不一致，拒绝写入",
+            profile.base
+        );
+    }
+
+    // One session for read -> validate -> program -> read back. Attaching the
+    // OB algorithm does not affect ordinary memory reads.
+    let mut session = connect_with(cfg, tx, true)?;
+    let mut current = vec![0u8; OB_IMAGE_LEN];
+    {
+        let mut core = session.core(0).context("无法访问核心 0")?;
+        core.halt(Duration::from_millis(500)).ok();
+        core.read_8(base, &mut current)
+            .with_context(|| format!("读取当前选项字节 0x{base:08X} 失败"))?;
+        core.run().ok();
+    }
+    let old = ObImage::from_slice(&current)
+        .ok_or_else(|| anyhow!("当前选项字节长度不是 {OB_IMAGE_LEN} 字节"))?;
+    option_bytes::validate(&old, &image, acknowledged).map_err(anyhow::Error::msg)?;
+
+    for change in option_bytes::diff(profile.kind, &old, &image) {
+        let flag = if change.danger { " [高风险]" } else { "" };
+        log(
+            tx,
+            if change.danger { Level::Warn } else { Level::Info },
+            format!("{}: {} → {}{}", change.label, change.from, change.to, flag),
+        );
+    }
+    log(tx, Level::Warn, "正在写入选项字节，请勿断开调试器或断电…");
+    log(tx, Level::Info, format!("当前: {}", old.hex()));
+    log(tx, Level::Info, format!("目标: {}", image.hex()));
+
+    let staging = std::env::temp_dir().join(format!(
+        "probe-rs-studio-ob-{}.bin",
+        std::process::id()
+    ));
+    fs::write(&staging, &image.bytes).context("暂存选项字节镜像失败")?;
+    let mut options = DownloadOptions::default();
+    options.verify = true;
+    options.keep_unwritten_bytes = false;
+    options.do_chip_erase = false;
+    options.preverify = false;
+    let result = flashing::download_file_with_options(
+        &mut session,
+        &staging,
+        BinLoader(BinOptions {
+            base_address: Some(base),
+            skip: 0,
+        }),
+        options,
+    );
+    let _ = fs::remove_file(&staging);
+    result.context("写入选项字节失败（OPT.FLM 算法执行出错）")?;
+
+    // Independent read-back, not just the loader's internal verify.
+    let mut readback = vec![0u8; OB_IMAGE_LEN];
+    {
+        let mut core = session.core(0).context("回读时无法访问核心 0")?;
+        core.read_8(base, &mut readback)
+            .context("回读选项字节失败")?;
+    }
+    if readback != image.bytes.as_slice() {
+        bail!(
+            "选项字节回读不一致\n期望 {}\n实际 {}",
+            image.hex(),
+            readback
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    log(tx, Level::Ok, "选项字节写入并回读校验通过");
+    reset_target(&mut session, tx)?;
+    log(
+        tx,
+        Level::Warn,
+        "选项字节通常在重新上电后完全生效；如未生效请给目标板断电重启",
+    );
+    Ok("选项字节写入成功 · 16 字节 · 回读一致".to_owned())
+}
+
+/// Headless, read-only inspection: `--option-bytes [base]`. Never writes.
+pub fn option_bytes_cli(cfg: &FlashConfig, base: u64) {
+    let (tx, rx) = mpsc::channel();
+    println!("读取选项字节 0x{base:08X} …");
+    match read_ob_snapshot(cfg, base, &tx) {
+        Ok(snapshot) => {
+            while let Ok(ev) = rx.try_recv() {
+                if let Event::Log(level, msg) = ev {
+                    println!("    [{level:?}] {msg}");
+                }
+            }
+            println!();
+            println!("{}", option_bytes::describe(&snapshot));
+            println!("\n[PASS] 选项字节读取完成（只读，未写入任何数据）");
+        }
+        Err(err) => {
+            while let Ok(ev) = rx.try_recv() {
+                if let Event::Log(level, msg) = ev {
+                    println!("    [{level:?}] {msg}");
+                }
+            }
+            println!("[FAIL] {err:#}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1305,5 +1531,42 @@ mod tests {
                 "{name} needs a RAM region for the flash algorithm"
             );
         }
+    }
+
+    /// The bundled OPT.FLM description must actually be accepted by probe-rs
+    /// and cover exactly the 16-byte OB block. This catches a corrupted or
+    /// mis-addressed algorithm long before any hardware is touched.
+    #[test]
+    fn bundled_py32_option_byte_algorithm_is_loadable() {
+        let mut registry = Registry::from_builtin_families();
+        registry
+            .add_target_family_from_yaml(option_bytes::PY32_OPT_YAML)
+            .expect("bundled PY32 OPT YAML must parse");
+        let target = registry
+            .get_target_by_name(option_bytes::PY32_OB_VARIANT)
+            .expect("bundled PY32 OPT YAML must define its variant");
+        assert_eq!(target.flash_algorithms.len(), 1);
+        let algo = &target.flash_algorithms[0];
+        assert_eq!(algo.flash_properties.address_range.start, 0x1FFF_0E80);
+        assert_eq!(algo.flash_properties.address_range.end, 0x1FFF_0E90);
+        assert_eq!(algo.flash_properties.page_size, 16);
+        assert!(target
+            .memory_map
+            .iter()
+            .any(|r| r.as_nvm_region().is_some() && r.contains(0x1FFF_0E80)));
+        // It must NOT be a selectable chip in the general library.
+        assert!(!BUNDLED_FAMILIES
+            .iter()
+            .any(|(name, _)| name.contains("OPT")));
+    }
+
+    /// Writing must be impossible for chips whose OB address is not covered by
+    /// a bundled algorithm, while reading stays available for all of them.
+    #[test]
+    fn option_byte_profiles_gate_writes_but_never_reads() {
+        assert!(option_bytes::profile_for_chip("PY32F003x8").writable);
+        assert!(!option_bytes::profile_for_chip("PY32F002Bxx").writable);
+        assert!(!option_bytes::profile_for_chip("STM32F103C8").writable);
+        assert_eq!(option_bytes::OB_IMAGE_LEN, 16);
     }
 }

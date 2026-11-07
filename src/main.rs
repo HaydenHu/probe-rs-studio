@@ -4,6 +4,7 @@ mod app;
 mod backend;
 mod firmware;
 mod icons;
+mod option_bytes;
 mod pack;
 mod serial;
 mod theme;
@@ -106,6 +107,31 @@ fn main() -> eframe::Result<()> {
             ports.len(),
             ports.iter().filter(|p| p.is_debug_vcp()).count()
         );
+        std::process::exit(0);
+    }
+
+    // Headless, READ-ONLY option-byte inspection:
+    //   --option-bytes [chip] [--ob-base 0x1FFF0E80]
+    if let Some(pos) = args.iter().position(|a| a == "--option-bytes") {
+        // Reuse the GUI's saved link settings (stable probe identity + SWD
+        // speed). The bare defaults can pick a different probe/speed and make
+        // a headless read behave differently from the UI.
+        let mut cfg = saved_flash_config().unwrap_or_default();
+        if let Some(chip) = args.get(pos + 1).filter(|s| !s.starts_with("--")) {
+            cfg.chip = chip.clone();
+        }
+        if let Some(speed) = cli_opt(&args, "--speed").and_then(|s| s.parse::<u32>().ok()) {
+            cfg.speed_khz = speed;
+        }
+        let profile = option_bytes::profile_for_chip(&cfg.chip);
+        let base = cli_opt(&args, "--ob-base")
+            .and_then(|s| option_bytes::parse_base(&s))
+            .unwrap_or(profile.base);
+        println!(
+            "选项字节只读自检: {} · {} · 0x{base:08X}",
+            cfg.chip, profile.label
+        );
+        backend::option_bytes_cli(&cfg, base);
         std::process::exit(0);
     }
 
@@ -302,6 +328,15 @@ fn serial_loopback(name: &str, cfg: serial::SerialSettings, payload: &[u8]) -> i
         println!("[FAIL] 未收到完整回环数据（检查 TX/RX 短接、所选端口与波特率）");
         1
     }
+}
+
+/// Load the GUI's persisted link settings next to the executable, so headless
+/// commands attach to exactly the same probe with the same SWD speed.
+fn saved_flash_config() -> Option<backend::FlashConfig> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.join("probe-rs-studio.json");
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    serde_json::from_value(value.get("config")?.clone()).ok()
 }
 
 /// Fetch a `--key value` pair from the argument list.

@@ -23,6 +23,7 @@
 - **定时发送**：设定周期（100 ms – 1 小时）后自动重发发送区内容，显示累计次数；关闭串口或会话中断会立即停发，启用状态不写进配置，重启不会自己发
 - **彩色 emoji 快捷输入**：发送区可展开一排彩色 emoji 与常用 AT 指令，点击插入到光标处（按字符索引，中文 / emoji 混排不会切坏 UTF-8）；egui 0.37 配合 epaint `color_fonts` 与系统 Segoe UI Emoji 字体渲染真彩色字形
 - **Ctrl + 滚轮缩放**：接收区与发送区各自独立调整字号（8–32 pt），标题旁实时显示当前字号，随配置持久化
+- **选项字节设置**：读取 / 编辑芯片的读保护 RDP、BOR、看门狗、NRST、BOOT1、SDK 与写保护 WRP；自动维护全部反码字节、显示变更 diff、写入需勾选风险确认并二次点击，写入走厂商专用 OPT.FLM 算法并回读校验
 - 内置约 4700 个芯片型号，另附 Holychip HC32F4XX 系列；**内置库没有的芯片用同一个「加载芯片支持…」入口导入厂商 `.pack` / `.pack.zip`、已解压目录，或只给一个 `.FLM` 算法**（按文件类型自动分流，纯 Rust 解析并永久保存），支持外部 `.yaml` 芯片描述
 - **最近确认的型号**：点选、连接或烧录时自动记录（最多 8 个），搜索框下方给出随输入过滤的快捷按钮，型号列表把历史置顶并标注「· 最近」，工作台也能一键切回；随配置持久化，旧配置自动以当前已选型号作为首条历史
 - HEX / ELF / BIN 固件解析（地址区间、记录数、SHA256），支持拖拽载入
@@ -287,6 +288,84 @@ DAPLink 虚拟串口 `COM10`（`c251:f001`，`MI_00`），**TX/RX 已短接**，
 
 需要清空时，退出程序后编辑 `probe-rs-studio.json`，把 `recent_chips` 改成 `[]`。
 
+## 选项字节设置（Option Bytes）
+
+顶部工具栏「选项字节」或工作台左栏「选项字节设置…」打开独立窗口；
+也可以用 `probe-rs-studio.exe --ob-open` 启动后直接进入该窗口。
+
+PY32F0xx 的布局来自 Puya 官方 CMSIS 头文件 `py32f003x8.h` 的 `OB_TypeDef`
+与 `Puya.PY32F0xx_DFP.pdsc`：选项字节是 `0x1FFF0E80` 起 **16 字节**，
+每个配置字节都跟着自己的按位反码，硬件用反码校验配置是否有效。
+
+| 偏移 | 字段 | 说明 |
+| --- | --- | --- |
+| `0x00 / 0x02` | `RDP / nRDP` | `0xAA` = Level 0 无保护，`0x55` = Level 1 读保护 |
+| `0x01 / 0x03` | `USER / nUSER` | `FLASH_OPTR[15:8]`：BOR 使能、BOR 阈值(3 bit)、IWDG_SW、WWDG_SW、NRST_MODE、nBOOT1 |
+| `0x04..0x07` | `SDK_STRT / SDK_END` 及反码 | 安全区起止块（2 KiB 粒度） |
+| `0x08..0x0B` | 保留 | 固定 `0xFF` |
+| `0x0C..0x0F` | `WRP / nWRP` | 16 位写保护掩码（u16 LE），某位为 0 表示对应扇区被保护 |
+
+窗口里可以：读取当前 16 字节、按字段下拉编辑、直接编辑原始 HEX、一键「补全反码」、
+查看当前值 / 目标值与逐项变更 diff、复制目标 HEX、恢复为芯片当前值。
+字段编辑会自动重算全部反码并把保留字节置为 `0xFF`，避免写出被 FLASH 控制器
+以 `OPTVERR` 拒绝的块。
+
+### 写入与安全护栏
+
+- **写入算法**：普通 Flash 算法不覆盖 `0x1FFF0E80`。程序内嵌了由
+  `PY32F0xx_OPT.FLM` 转换出的算法描述（`assets/PY32F0xx_OPT.yaml`），
+  写入时把该算法和它的 16 字节 NVM 区临时挂到当前 target 上，
+  再由 probe-rs 标准 `FlashLoader` 完成擦除 / 编程 / 校验，最后独立回读比对并复位。
+  不手工戳 FLASH 控制器寄存器。它只在 `assets/` 中编译进二进制，
+  不会作为可选芯片出现在芯片库里。
+- **二次确认**：必须勾选「我已了解风险」，且「写入选项字节」要点击两次。
+  后端会再次调用 `option_bytes::validate()` 校验，无法绕过。
+- **拒绝写入的情况**：目标与当前相同、反码/保留字节不匹配、全 `0x00`、
+  RDP 不是 `0xAA/0x55`、RDP 改变但未勾选风险确认、OB 基址与内置算法地址不一致。
+- **编辑状态不持久化**：窗口开关、待写镜像、风险勾选、二次确认状态都不写进
+  `probe-rs-studio.json`，重启后不会残留一个待写入操作。
+- 写入后需要给目标板**重新上电**，选项字节才会完全生效。
+
+> ⚠️ 错误的 RDP / BOOT1 / NRST 配置可能让芯片无法通过 SWD 再次连接，
+> 恢复通常需要整片擦除（会清除用户 Flash）。**写入路径未在真机上执行验证**
+> （避免损坏在用芯片）；只读路径、字段编解码、反码、校验规则和
+> 内置 OPT 算法能否被 probe-rs 解析，均有单元测试与真机只读验证覆盖。
+> 首次对某块板子写入前，请先用 `--option-bytes` 只读核对。
+
+### 芯片支持范围
+
+| 芯片 | OB 基址 | 字段编辑 | 写入 |
+| --- | --- | --- | --- |
+| PY32F003 / PY32F030 / PY32F0xx | `0x1FFF0E80` | 支持 | 支持（内置 `PY32F0xx_OPT.FLM`） |
+| PY32F002B | `0x1FFF0080` | 支持 | 只读 / 导出，需要 `PY32F002Bxx_OPT.FLM` |
+| PY32F071 / PY32F072 | `0x1FFF3080` | 支持 | 只读 / 导出，需要对应 OPT.FLM |
+| 其它芯片 | 手填基址 | 仅原始 16 字节 HEX | 只读 / 导出 |
+
+未知芯片不会臆造位定义：只显示原始字节，避免给出错误的字段含义。
+`USER` 各位的含义按 Puya SDK 的 `FLASH_OPTR` 位定义映射，
+个别子型号若有差异，请以对应参考手册为准。
+
+### 真机验证（PY32F003x8 · DAPLink `c251:f001`）
+
+```text
+芯片 PY32F003x8 · PY32F003 / F030 · 官方 SDK
+OB 区 0x1FFF0E80 · 16 字节
+原始: AA FE 55 01 1F 00 E0 FF FF FF FF FF FF FF 00 00
+反码: 校验通过
+  读保护 RDP = Level 0 · 无读保护
+  BOR 阈值   = 3.1 – 3.2 V
+  独立看门狗 = 软件看门狗      窗口看门狗 = 软件看门狗
+  NRST 引脚  = NRST 作 GPIO     BOOT1 = 系统存储器
+  SDK 起始块 = 0x1F             SDK 结束块 = 0x00
+  写保护 WRP = 0xFFFF
+[PASS] 选项字节读取完成（只读，未写入任何数据）
+```
+
+注意：本机的这块 DAPLink 在 **1000 kHz** 下会出现 CMSIS-DAP
+`Command ID in response (0x0) does not match...`，切到 GUI 保存的
+**10000 kHz** 才能稳定连接。`--option-bytes` 会复用
+`probe-rs-studio.json` 里的探针身份与 SWD 速度，也可以用 `--speed` 覆盖。
+
 ## 自检与诊断
 
 ```bash
@@ -311,8 +390,15 @@ probe-rs-studio.exe --ports
 probe-rs-studio.exe --loopback COM10
 probe-rs-studio.exe --loopback COM10 --baud 9600 --text "AT\r\n"
 
+# 选项字节只读自检：打印 16 字节原始值、反码校验结果与逐字段解析（不写入）
+probe-rs-studio.exe --option-bytes
+probe-rs-studio.exe --option-bytes PY32F003x8 --ob-base 0x1FFF0E80 --speed 10000
+
+# 启动 GUI 并直接打开「选项字节设置」窗口
+probe-rs-studio.exe --ob-open
+
 # 单元测试（hex 查看器、pack 转换、串口枚举 / 参数 / HEX 解析、定时发送、缩放、快捷输入、
-# 矢量图标、主题配色、热插拔 diff、Registry 解析）
+# 选项字节编解码与反码、矢量图标、主题配色、热插拔 diff、Registry 解析 OPT 算法）
 cargo test --release --bin probe-rs-studio
 ```
 
@@ -325,6 +411,9 @@ cargo test --release --bin probe-rs-studio
 - 结果：烧录约 2.54 秒，库内校验 + 独立读回 SHA256 一致 + 复位成功
 - DAPLink 虚拟串口 `COM10`（`c251:f001`，`MI_00`）：识别为「调试器虚拟串口」；**TX/RX 短接回环**
   115200 8N1 下文本 / HEX / 彩色 emoji 发送与接收、定时发送、Ctrl+滚轮缩放全部验证通过
+- 选项字节：`--option-bytes` 在 10000 kHz 下只读读出 `0x1FFF0E80` 的 16 字节，
+  反码校验通过，字段解析与厂商 SDK 位定义一致；GUI 窗口渲染、字段编辑与风险护栏已验证。
+  **写入路径未做真机执行验证**（避免误锁芯片），见上文说明。
 - Holychip HC32F4XX：已完成芯片描述解析与 Flash 算法完整性验证（单元测试覆盖 3 个型号、
   指令 blob、入口偏移、NVM/RAM 区间）。本机暂无该系列硬件，**未做真机烧录验证**。
 
@@ -333,15 +422,17 @@ cargo test --release --bin probe-rs-studio
 ## 目录结构
 
 ```
-src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback 分派
-src/app.rs        会话侧栏、16 进制查看器、串口终端（定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
-src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、探针与串口监视、串口会话线程、芯片描述导入
+src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --ob-open 分派
+src/app.rs        会话侧栏、16 进制查看器、串口终端（定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、选项字节设置窗口、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
+src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
+src/option_bytes.rs  选项字节 16 字节镜像、字段编解码、反码维护、变更 diff 与安全校验（纯逻辑，可单测）
 src/pack.rs       CMSIS-Pack 转换器：ZIP / pdsc XML / ELF32 FLM / target YAML（纯 Rust）
 src/firmware.rs   HEX / ELF / BIN 解析与 SHA256
 src/serial.rs     纯 Rust Win32 FFI 串口枚举、线路参数、独占打开、非阻塞收发与队列诊断
 src/theme.rs      深浅两套配色、CJK 与彩色 emoji 系统字体 fallback（emoji 排在 CJK 之前）
 src/icons.rs      SVG 子集解析 + epaint 矢量绘制
 assets/icons/     6 个 SVG 图标 + Windows 任务栏图标 RGBA
+assets/PY32F0xx_OPT.yaml  由 PY32F0xx_OPT.FLM 生成的内置选项字节算法描述（编译进二进制）
 targets/          CMSIS-Pack 转换出的扩展芯片描述 YAML
 tests/fixtures/   精简 pack 与 .pack.zip 测试样本
 tools/gen_icons.py  由统一几何定义生成 SVG 与 OS 图标
