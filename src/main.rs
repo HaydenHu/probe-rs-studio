@@ -2,6 +2,7 @@
 
 mod app;
 mod backend;
+mod chip_id;
 mod firmware;
 mod icons;
 mod option_bytes;
@@ -139,6 +140,37 @@ fn main() -> eframe::Result<()> {
             cfg.chip, profile.label
         );
         backend::option_bytes_cli(&cfg, base);
+        std::process::exit(0);
+    }
+
+    // Headless, READ-ONLY target identification:
+    //   --chip-id [chip] [--speed N] [--id-addr 0x40015800]
+    if let Some(pos) = args.iter().position(|a| a == "--chip-id") {
+        let mut cfg = saved_flash_config().unwrap_or_default();
+        if let Some(chip) = args.get(pos + 1).filter(|s| !s.starts_with("--")) {
+            cfg.chip = chip.clone();
+        }
+        if let Some(speed) = cli_opt(&args, "--speed").and_then(|s| s.parse::<u32>().ok()) {
+            cfg.speed_khz = speed;
+        }
+        let custom = match cli_u64(&args, "--id-addr") {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        };
+        let profile = chip_id::profile_for_chip(&cfg.chip);
+        println!(
+            "芯片 ID 只读自检: {} · {} · {} kHz{}",
+            cfg.chip,
+            profile.label,
+            cfg.speed_khz,
+            custom
+                .map(|a| format!(" · 自定义 0x{a:08X}"))
+                .unwrap_or_default()
+        );
+        backend::chip_id_cli(&cfg, custom);
         std::process::exit(0);
     }
 

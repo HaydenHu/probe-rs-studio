@@ -30,6 +30,7 @@ GUI 侧另有兜底：`Connect` / `ReadBack` / `Flash` / `VerifyFirmware` / `Era
 - **彩色 emoji 快捷输入**：发送区可展开一排彩色 emoji 与常用 AT 指令，点击插入到光标处（按字符索引，中文 / emoji 混排不会切坏 UTF-8）；egui 0.37 配合 epaint `color_fonts` 与系统 Segoe UI Emoji 字体渲染真彩色字形
 - **Ctrl + 滚轮缩放**：接收区与发送区各自独立调整字号（8–32 pt），标题旁实时显示当前字号，随配置持久化
 - **选项字节设置**：读取 / 编辑芯片的读保护 RDP、BOR、看门狗、NRST、BOOT1、SDK 与写保护 WRP；自动维护全部反码字节、显示变更 diff、写入需勾选风险确认并二次点击，写入走厂商专用 OPT.FLM 算法并回读校验
+- **读取目标芯片 ID**：只读采集 SWD `DPIDR`、CoreSight ROM Table（制造商 / 部件号）、`CPUID`（内核型号）、厂商 `DBGMCU_IDCODE`（DEV_ID / REV_ID）、96 位 UID 与 Flash 容量；内置 PY32F0xx / 常见 STM32 寄存器映射，其它型号走通用寄存器并可填自定义地址。顶部工具栏与左栏均可打开独立报告窗口，烧录选项里还可勾选「烧录前读取芯片 ID」，在同一连接内自动记录身份到日志
 - 内置约 4700 个芯片型号，另附 Holychip HC32F4XX 系列；**内置库没有的芯片用同一个「加载芯片支持…」入口导入厂商 `.pack` / `.pack.zip`、已解压目录，或只给一个 `.FLM` 算法**（按文件类型自动分流，纯 Rust 解析并永久保存），支持外部 `.yaml` 芯片描述
 - **最近确认的型号**：点选、连接或烧录时自动记录（最多 8 个），搜索框下方给出随输入过滤的快捷按钮，型号列表把历史置顶并标注「· 最近」，工作台也能一键切回；随配置持久化，旧配置自动以当前已选型号作为首条历史
 - HEX / ELF / BIN 固件解析（地址区间、记录数、SHA256），支持拖拽载入
@@ -373,6 +374,43 @@ OB 区 0x1FFF0E80 · 16 字节
 **10000 kHz** 才能稳定连接。`--option-bytes` 会复用
 `probe-rs-studio.json` 里的探针身份与 SWD 速度，也可以用 `--speed` 覆盖。
 
+## 读取目标芯片 ID
+
+顶部工具栏「芯片 ID」或工作台左栏「读取芯片 ID…」打开独立窗口，点「读取芯片 ID」
+即可连接当前探针并生成报告；`--id-open` 可以启动后直接进入该窗口。窗口支持
+一键复制全部结果、填写自定义地址（按小端 32 位读取）、清空旧结果；如果报告来自
+另一块板子（型号与当前选择不一致），会显示醒目提示要求重新读取。
+
+| 来源 | 寄存器 / 位置 | 得到什么 |
+| --- | --- | --- |
+| SWD DP | `DPIDR`（DP 寄存器 0，bank 0） | DP 版本、部件号、设计者 JEP106 厂商名 |
+| CoreSight | ROM Table（由 AP 基址自动发现） | 制造商 + 部件号，**对没有内置映射的型号也可用** |
+| Cortex-M | `SCB->CPUID @ 0xE000ED00` | 内核型号（M0/M0+/M3/M4/M7…）、架构、版本 |
+| 厂商 | `DBGMCU_IDCODE` | `DEV_ID[11:0]`、`REV_ID[31:16]` |
+| 厂商 | 96 位 UID | 出厂唯一序列号 |
+| 厂商 | Flash 容量寄存器（16 位，KiB） | 标称 Flash 容量 |
+
+内置映射：
+
+- **PY32F0xx**（`PY32F002 / F003 / F030 / F07x`）：地址全部取自 Puya 官方 CMSIS
+  头文件与 `py32f0xx_hal.c` —— `IDCODE 0x40015800`、`UID 0x1FFF0E00`、
+  `FlashSize 0x1FFF0FFC`。
+- **STM32F1 / F0·F3 / F4**：常见参考手册地址，界面里明确标注「请按具体型号核对」；
+  不同容量与子系列的系统存储区可能不同。
+- **其它型号**（MM32、HC32、GD32 等）：只使用通用 ARM 寄存器与 ROM Table，
+  在窗口里填自定义地址即可补读厂商 ID 寄存器。ROM Table 扫描会走几十次 SWD
+  传输，所以**只对没有内置映射的型号执行**；PY32F0xx 这类已知型号不做这一步，
+  烧录前的身份采集只是 5 次轻量寄存器读。
+
+**烧录前读取芯片 ID** 是左栏的一个可勾选选项，**默认关闭**，避免改变现有烧录流程。
+勾选后在 `Flash` 任务的同一连接内先做只读采集，把身份写进日志台并刷新报告窗口；
+任何单项寄存器读取失败都只记 `[WARN]`，不会中断烧录。该选项随
+`probe-rs-studio.json` 持久化，旧配置文件缺少该字段时按关闭处理。所有报告都是
+运行时状态，**不写入配置文件**，重启后不会拿上一次的板子冒充当前芯片。
+
+> 芯片 ID 与「选项字节」是两件事：前者只读识别硅片身份，后者会改写配置 NVM。
+> 两者共用同一套连接参数，但读取 ID 不会改变芯片任何内容。
+
 ## 自检与诊断
 
 ```bash
@@ -405,11 +443,17 @@ probe-rs-studio.exe --loopback COM10 --baud 9600 --text "AT\r\n"
 probe-rs-studio.exe --option-bytes
 probe-rs-studio.exe --option-bytes PY32F003x8 --ob-base 0x1FFF0E80 --speed 10000
 
+# 芯片 ID 只读自检：打印 DPIDR / ROM Table / CPUID / IDCODE / UID / Flash 容量
+probe-rs-studio.exe --chip-id
+probe-rs-studio.exe --chip-id PY32F003x8 --speed 10000
+probe-rs-studio.exe --chip-id MM32L373PF --id-addr 0x40015800
+
 # 启动 GUI 并直接打开「选项字节设置」窗口
 probe-rs-studio.exe --ob-open
 
 # 单元测试（hex 查看器、pack 转换、串口枚举 / 参数 / HEX 解析、定时发送、缩放、快捷输入、
-# 选项字节编解码与反码、探针任务重试策略、矢量图标、主题配色、热插拔 diff、Registry 解析 OPT 算法）
+# 选项字节编解码与反码、芯片 ID 解码与预设、探针任务重试策略、矢量图标、主题配色、
+# 热插拔 diff、Registry 解析 OPT 算法）
 cargo test --release --bin probe-rs-studio
 ```
 
@@ -437,9 +481,10 @@ cargo test --release --bin probe-rs-studio
 ## 目录结构
 
 ```
-src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --ob-open 分派
-src/app.rs        会话侧栏、16 进制查看器、串口终端（定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、选项字节设置窗口、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
-src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
+src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --ob-open / --id-open 分派
+src/app.rs        会话侧栏、16 进制查看器、串口终端（定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、选项字节与芯片 ID 窗口、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
+src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
+src/chip_id.rs    芯片 ID 寄存器预设与 CPUID / DPIDR / IDCODE / UID / FlashSize 解码、报告格式化（纯逻辑，可单测）
 src/option_bytes.rs  选项字节 16 字节镜像、字段编解码、反码维护、变更 diff 与安全校验（纯逻辑，可单测）
 src/pack.rs       CMSIS-Pack 转换器：ZIP / pdsc XML / ELF32 FLM / target YAML（纯 Rust）
 src/firmware.rs   HEX / ELF / BIN 解析与 SHA256

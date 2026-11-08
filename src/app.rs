@@ -21,6 +21,7 @@ use crate::{
         self, ChipItem, Event, FlashConfig, Job, Level, ProbeItem, Protocol, SerialCommand,
         WatcherControl,
     },
+    chip_id::{self, ChipIdSnapshot},
     firmware::{self, FirmwareFormat, FirmwareInfo},
     icons::{IconKind, IconSet},
     option_bytes::{self, ObImage, ObSnapshot},
@@ -421,6 +422,15 @@ enum ObAction {
     Copy(String),
 }
 
+/// Actions collected inside the chip-ID window closure, folded back into the
+/// app after `Window::show()` so `self` is never borrowed from inside egui.
+enum ChipIdAction {
+    None,
+    Read(Option<u64>),
+    Copy(String),
+    Clear,
+}
+
 pub struct App {
     icons: IconSet,
     cfg: FlashConfig,
@@ -504,6 +514,12 @@ pub struct App {
     ob_base_text: String,
     ob_acknowledge: bool,
     ob_armed: bool,
+    /// Read-only chip identification window. Never persisted: a snapshot from
+    /// a previous board must not be mistaken for the currently attached one.
+    chip_id_open: bool,
+    chip_id_snapshot: Option<ChipIdSnapshot>,
+    chip_id_custom: String,
+    chip_id_custom_error: Option<String>,
 }
 
 /// How many recently confirmed chip models are kept in the settings file.
@@ -682,6 +698,12 @@ impl App {
             ),
             ob_acknowledge: false,
             ob_armed: false,
+            // `--id-open` starts straight into the chip-ID report; handy when
+            // checking a freshly connected board.
+            chip_id_open: std::env::args().any(|a| a == "--id-open"),
+            chip_id_snapshot: None,
+            chip_id_custom: String::new(),
+            chip_id_custom_error: None,
         };
         app.push_log(Level::Info, "ProbeRS Studio 已启动 · 直接链接 probe-rs 库");
         app.push_log(Level::Debug, format!("配置文件: {}", app.config_path.display()));
@@ -796,6 +818,9 @@ impl App {
                     }
                 }
                 Event::OptionBytes(snapshot) => self.on_option_bytes(snapshot),
+                Event::ChipId(snapshot) => {
+                    self.chip_id_snapshot = Some(snapshot);
+                }
                 Event::Connected(text) => self.connection = Some(text),
                 Event::Progress { value, label } => {
                     self.progress = value;
@@ -963,6 +988,7 @@ impl App {
                 | Job::VerifyFirmware(_)
                 | Job::EraseAll(_)
                 | Job::Reset(_)
+                | Job::ReadChipId { .. }
         ) {
             let chip = self.cfg.chip.clone();
             self.remember_chip(&chip);
@@ -1201,6 +1227,9 @@ impl App {
                         }
                         if Self::ghost_button(ui, p, "芯片库", true).clicked() {
                             self.nav = Nav::Chips;
+                        }
+                        if Self::ghost_button(ui, p, "芯片 ID", true).clicked() {
+                            self.chip_id_open = true;
                         }
                         if Self::ghost_button(ui, p, "选项字节", true).clicked() {
                             self.ob_open = true;
@@ -1513,6 +1542,8 @@ impl App {
         ui.checkbox(&mut self.cfg.reset_after, "完成后复位运行");
         ui.checkbox(&mut self.cfg.preverify, "预校验跳过相同区域");
         ui.checkbox(&mut self.cfg.chip_erase, "整片擦除");
+        ui.checkbox(&mut self.cfg.read_chip_id_before_flash, "烧录前读取芯片 ID")
+            .on_hover_text("在同一连接内只读 DPIDR / CPUID / 厂商 IDCODE / UID，并记录到日志，不中断烧录");
         ui.add_space(8.0);
         let full = ui.available_width();
         if Self::sidebar_button(ui, p, "开始烧录", self.can_run() && self.firmware.is_some(), true, full)
@@ -1582,6 +1613,23 @@ impl App {
                 let base = option_bytes::profile_for_chip(&self.cfg.chip).base;
                 self.ob_base_text = format!("0x{base:08X}");
             }
+        }
+        if Self::sidebar_button(
+            ui,
+            p,
+            if self.chip_id_open {
+                "芯片 ID（已打开）"
+            } else {
+                "读取芯片 ID…"
+            },
+            true,
+            false,
+            ui.available_width(),
+        )
+        .on_hover_text("只读识别目标：DPIDR / CPUID / 厂商 IDCODE / 96 位 UID / Flash 容量")
+        .clicked()
+        {
+            self.chip_id_open = true;
         }
         ui.horizontal(|ui| {
             let path = self.cfg.backup_path.display().to_string();
@@ -2836,6 +2884,231 @@ impl App {
         }
     }
 
+    /// Read-only chip identification window. A snapshot is only ever displayed
+    /// after an explicit read (or a flash with the pre-check option enabled),
+    /// and a chip mismatch is flagged so an old board's ID is never mistaken
+    /// for the currently selected model.
+    fn draw_chip_id_dialog(&mut self, ctx: &egui::Context, p: Palette) {
+        if !self.chip_id_open {
+            return;
+        }
+        let chip = self.cfg.chip.clone();
+        let profile = chip_id::profile_for_chip(&chip);
+        let snapshot = self.chip_id_snapshot.clone();
+        let can_run = self.can_run();
+        let mut custom = self.chip_id_custom.clone();
+        let mut custom_error = self.chip_id_custom_error.clone();
+        let mut open = true;
+        let mut action = ChipIdAction::None;
+
+        egui::Window::new("目标芯片 ID")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(700.0)
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("{chip} · {}", profile.label))
+                        .size(15.0)
+                        .strong()
+                        .color(p.text),
+                );
+                ui.label(RichText::new(profile.source).size(10.0).color(p.text3));
+                if profile.kind == chip_id::IdKind::Generic {
+                    ui.label(
+                        RichText::new(
+                            "未内置厂商映射：仅能读取通用 ARM 寄存器，可填写下方自定义地址",
+                        )
+                        .size(10.0)
+                        .color(p.warn),
+                    );
+                }
+                ui.label(
+                    RichText::new("只读：全部为寄存器读取，不会改写 Flash 或选项字节")
+                        .size(10.0)
+                        .color(p.success),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_run, egui::Button::new("读取芯片 ID"))
+                        .on_hover_text("按当前选中的探针与芯片连接一次，读取全部可用 ID 寄存器")
+                        .clicked()
+                    {
+                        let addr = if custom.trim().is_empty() {
+                            custom_error = None;
+                            None
+                        } else {
+                            match parse_num(&custom) {
+                                Some(a) => {
+                                    custom_error = None;
+                                    Some(a)
+                                }
+                                None => {
+                                    custom_error = Some(
+                                        "自定义地址无效，示例：0x40015800（可留空）".to_owned(),
+                                    );
+                                    None
+                                }
+                            }
+                        };
+                        if custom_error.is_none() {
+                            action = ChipIdAction::Read(addr);
+                        }
+                    }
+                    if ui.button("清空结果").clicked() {
+                        action = ChipIdAction::Clear;
+                    }
+                    if ui
+                        .add_enabled(snapshot.is_some(), egui::Button::new("复制全部"))
+                        .clicked()
+                    {
+                        action = ChipIdAction::Copy(
+                            snapshot.as_ref().map(|s| s.text()).unwrap_or_default(),
+                        );
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("自定义地址").size(10.0).color(p.text3));
+                    ui.add_sized(
+                        [160.0, 22.0],
+                        egui::TextEdit::singleline(&mut custom)
+                            .hint_text("0x40015800（可留空）"),
+                    );
+                    ui.label(
+                        RichText::new("额外按小端 32 位读取，适合未内置映射的型号")
+                            .size(10.0)
+                            .color(p.text3),
+                    );
+                });
+                if let Some(err) = &custom_error {
+                    ui.label(RichText::new(err.clone()).size(10.0).color(p.error));
+                }
+                ui.add_space(4.0);
+                ui.separator();
+
+                match &snapshot {
+                    None => {
+                        ui.label(
+                            RichText::new("尚未读取芯片 · 点「读取芯片 ID」连接目标并采集身份信息")
+                                .size(11.0)
+                                .color(p.warn),
+                        );
+                    }
+                    Some(snap) => {
+                        if snap.chip != chip {
+                            ui.label(
+                                RichText::new(format!(
+                                    "⚠ 该结果来自 {}，当前选择为 {chip}，请重新读取",
+                                    snap.chip
+                                ))
+                                .size(10.0)
+                                .color(p.warn),
+                            );
+                        }
+                        egui::ScrollArea::vertical()
+                            .id_salt("chip_id_scroll")
+                            .max_height(330.0)
+                            .show(ui, |ui| {
+                                egui::Grid::new("chip_id_grid")
+                                    .num_columns(3)
+                                    .spacing([12.0, 6.0])
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new("寄存器").size(10.0).color(p.text3),
+                                        );
+                                        ui.label(
+                                            RichText::new("地址").size(10.0).color(p.text3),
+                                        );
+                                        ui.label(
+                                            RichText::new("原始值 / 解析")
+                                                .size(10.0)
+                                                .color(p.text3),
+                                        );
+                                        ui.end_row();
+                                        for field in &snap.fields {
+                                            ui.label(
+                                                RichText::new(field.label.clone())
+                                                    .size(11.0)
+                                                    .strong()
+                                                    .color(p.text),
+                                            );
+                                            let addr = field
+                                                .address
+                                                .map(|a| format!("0x{a:08X}"))
+                                                .unwrap_or_else(|| "DP 寄存器".to_owned());
+                                            ui.label(
+                                                RichText::new(addr)
+                                                    .monospace()
+                                                    .size(10.0)
+                                                    .color(p.text3),
+                                            );
+                                            ui.vertical(|ui| {
+                                                ui.label(
+                                                    RichText::new(field.raw.clone())
+                                                        .monospace()
+                                                        .size(11.0)
+                                                        .color(p.accent),
+                                                );
+                                                ui.label(
+                                                    RichText::new(field.detail.clone())
+                                                        .size(10.0)
+                                                        .color(p.text2),
+                                                );
+                                            });
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
+                        for warning in &snap.warnings {
+                            ui.label(
+                                RichText::new(format!("⚠ {warning}"))
+                                    .size(10.0)
+                                    .color(p.warn),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!("共 {} 项", snap.fields.len()))
+                                .size(10.0)
+                                .color(p.text3),
+                        );
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new(profile.note).size(10.0).color(p.text3));
+            });
+
+        self.chip_id_custom = custom;
+        self.chip_id_custom_error = custom_error;
+        if !open {
+            self.chip_id_open = false;
+            return;
+        }
+        match action {
+            ChipIdAction::None => {}
+            ChipIdAction::Clear => {
+                self.chip_id_snapshot = None;
+                self.chip_id_custom_error = None;
+            }
+            ChipIdAction::Copy(text) => {
+                ctx.copy_text(text);
+                self.push_log(Level::Info, "芯片 ID 报告已复制到剪贴板");
+            }
+            ChipIdAction::Read(custom) => {
+                self.push_log(Level::Info, "读取目标芯片 ID（只读）…");
+                self.start_job(
+                    Job::ReadChipId {
+                        cfg: Box::new(self.cfg.clone()),
+                        custom,
+                    },
+                    "读取芯片 ID",
+                );
+            }
+        }
+    }
+
     fn export_logs(&mut self) {
         let Some(path) = with_all_files(
             rfd::FileDialog::new().add_filter("日志", &["txt", "log"]),
@@ -3602,6 +3875,7 @@ impl eframe::App for App {
         self.draw_center(root, p);
         self.draw_flm_dialog(&ctx, p);
         self.draw_option_bytes_dialog(&ctx, p);
+        self.draw_chip_id_dialog(&ctx, p);
         self.persist();
 
         // Keep egui's global Visuals (checkboxes, selectable labels, scroll
@@ -4223,5 +4497,52 @@ mod tests {
             assert!(!body.contains(needle), "OB state leaked into Settings: {needle}");
         }
         assert!(source.contains("self.ob_acknowledge = false;"));
+    }
+
+    /// Chip ID must be reachable both as a standalone read and as an optional
+    /// pre-flash check, and must be wired to the headless CLI as well.
+    #[test]
+    fn chip_id_reader_is_wired_into_the_workbench_and_cli() {
+        let app = include_str!("app.rs");
+        for needle in [
+            "draw_chip_id_dialog",
+            "Event::ChipId(snapshot)",
+            "Job::ReadChipId",
+            "read_chip_id_before_flash",
+            "--id-open",
+            "复制全部",
+        ] {
+            assert!(app.contains(needle), "missing chip-ID UI wiring: {needle}");
+        }
+        let backend_src = include_str!("backend.rs");
+        for needle in [
+            "fn collect_chip_id",
+            "fn read_dpidr",
+            "pub fn chip_id_cli",
+            "cfg.read_chip_id_before_flash",
+        ] {
+            assert!(backend_src.contains(needle), "missing backend wiring: {needle}");
+        }
+        let main = include_str!("main.rs");
+        assert!(main.contains("mod chip_id;"));
+        assert!(main.contains("--chip-id"));
+        assert!(main.contains("--id-addr"));
+    }
+
+    /// A read from a board that has since been unplugged must never be
+    /// restored on the next launch, so none of this state lives in Settings.
+    #[test]
+    fn chip_id_snapshot_is_never_persisted() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split("struct Settings {")
+            .nth(1)
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
+        for needle in ["chip_id_open", "chip_id_snapshot", "chip_id_custom"] {
+            assert!(!body.contains(needle), "chip-ID state leaked into Settings: {needle}");
+        }
     }
 }

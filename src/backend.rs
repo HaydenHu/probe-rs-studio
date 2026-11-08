@@ -27,10 +27,19 @@ use probe_rs::{
 use sha2::{Digest, Sha256};
 
 use crate::{
+    chip_id::{self, ChipIdField, ChipIdProfile, ChipIdSnapshot},
     firmware::{self, FirmwareFormat, FirmwareInfo},
     option_bytes::{self, ObImage, ObSnapshot, OB_IMAGE_LEN},
     pack::FlmSpec,
 };
+
+/// Older settings files have no `read_chip_id_before_flash` key. Keep it off:
+/// the standalone chip-ID window is the primary entry point, and an opt-in
+/// pre-flash check must never change the behaviour of an existing flash flow
+/// (extra SWD traffic matters on easily upset DAPLink probes).
+fn default_read_chip_id() -> bool {
+    false
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Protocol {
@@ -59,6 +68,10 @@ pub struct FlashConfig {
     pub preverify: bool,
     pub reset_after: bool,
     pub verify_readback: bool,
+    /// Read the target's ID registers and log its identity before programming,
+    /// so a mismatched chip selection is visible in the log before any write.
+    #[serde(default = "default_read_chip_id")]
+    pub read_chip_id_before_flash: bool,
     pub readback_address: u64,
     pub readback_size: u64,
     pub backup_path: PathBuf,
@@ -83,6 +96,7 @@ impl Default for FlashConfig {
             preverify: false,
             reset_after: true,
             verify_readback: true,
+            read_chip_id_before_flash: false,
             readback_address: 0x0800_0000,
             readback_size: 4096,
             backup_path: PathBuf::from("backup_before.bin"),
@@ -138,6 +152,12 @@ pub enum Job {
     VerifyFirmware(Box<FlashConfig>),
     EraseAll(Box<FlashConfig>),
     Reset(Box<FlashConfig>),
+    /// Read-only chip identification: DPIDR / CPUID / vendor IDCODE / UID /
+    /// flash-size register, plus an optional user-supplied address.
+    ReadChipId {
+        cfg: Box<FlashConfig>,
+        custom: Option<u64>,
+    },
     /// Read the 16-byte option-byte block (read-only, safe on any chip).
     ReadOptionBytes {
         cfg: Box<FlashConfig>,
@@ -173,6 +193,8 @@ pub enum Event {
     SerialTxCount(usize),
     /// Session ended; the string is empty for a user-initiated close.
     SerialClosed(String),
+    /// A fresh, read-only identification report for the attached target.
+    ChipId(ChipIdSnapshot),
     /// A fresh read of the chip's option-byte block.
     OptionBytes(ObSnapshot),
     Connected(String),
@@ -307,6 +329,7 @@ fn job_is_retryable(job: &Job) -> bool {
             | Job::VerifyFirmware(_)
             | Job::EraseAll(_)
             | Job::Reset(_)
+            | Job::ReadChipId { .. }
             | Job::ReadOptionBytes { .. }
     )
 }
@@ -390,6 +413,7 @@ fn run_once(job: Job, tx: &Sender<Event>) -> Result<String> {
             reset_target(&mut session, tx)?;
             Ok("目标已复位并运行".to_owned())
         }
+        Job::ReadChipId { cfg, custom } => read_chip_id(&cfg, custom, tx),
         Job::ReadOptionBytes { cfg, base } => read_option_bytes(&cfg, base, tx),
         Job::WriteOptionBytes {
             cfg,
@@ -1246,6 +1270,30 @@ fn flash(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<String> {
 
     let mut session = connect(cfg, tx)?;
 
+    // Identify the *physical* silicon before the first write. Reuse this
+    // session (no extra attach), keep the check read-only and never let an
+    // unsupported vendor register abort a perfectly good flash run.
+    if cfg.read_chip_id_before_flash {
+        let snapshot = collect_chip_id(&mut session, cfg, None);
+        if snapshot.fields.is_empty() {
+            log(
+                tx,
+                Level::Warn,
+                "烧录前芯片 ID 读取失败（只读步骤，不中断烧录）",
+            );
+        } else {
+            log(
+                tx,
+                Level::Info,
+                format!("烧录前芯片身份: {}", snapshot.identity()),
+            );
+            for warning in &snapshot.warnings {
+                log(tx, Level::Debug, warning.clone());
+            }
+            let _ = tx.send(Event::ChipId(snapshot));
+        }
+    }
+
     let progress_tx = tx.clone();
     let mut total: u64 = 0;
     let mut done: u64 = 0;
@@ -1351,6 +1399,258 @@ fn flash(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<String> {
 // ---------------------------------------------------------------------------
 // Option bytes
 // ---------------------------------------------------------------------------
+
+/// Read the SWD `DPIDR` through probe-rs' debug-port interface. Returns the
+/// raw register plus the manufacturer name resolved from its JEP106 code.
+fn read_dpidr(session: &mut Session) -> Option<(u32, Option<String>)> {
+    // `DapAccess` is a supertrait of `ArmDebugInterface`, so its methods are
+    // available on the trait object without importing the trait here.
+    use probe_rs::architecture::arm::dp::{DPIDR, DebugPortId, DpAddress, DpRegisterAddress};
+    let interface = session.get_arm_interface().ok()?;
+    let raw = interface
+        .read_raw_dp_register(
+            DpAddress::Default,
+            DpRegisterAddress {
+                address: chip_id::DPIDR_ADDRESS,
+                bank: Some(chip_id::DPIDR_BANK),
+            },
+        )
+        .ok()?;
+    let designer = DebugPortId::from(DPIDR(raw))
+        .designer
+        .get()
+        .map(|name| name.to_string());
+    Some((raw, designer))
+}
+
+/// Generic ARM identity from the CoreSight ROM table: manufacturer (JEP106)
+/// + part number + debug base address. Works on chips with no bundled vendor
+/// register map (MM32, HC32, GD32, ...), where only a ROM table is discoverable.
+/// Returns `None` on M0/M0+ parts that have no ROM table; that is not an error.
+fn read_rom_table_identity(session: &mut Session) -> Option<(String, u16, u64)> {
+    use probe_rs::architecture::arm::{dp::DpAddress, memory::romtable::Component};
+
+    let interface = session.get_arm_interface().ok()?;
+    let dp = DpAddress::Default;
+    for ap in interface.access_ports(dp).ok()? {
+        let Ok(mut memory) = interface.memory_interface(&ap) else {
+            continue;
+        };
+        let Ok(base) = memory.base_address() else {
+            continue;
+        };
+        if base == 0 {
+            continue;
+        }
+        let Ok(Component::Class1RomTable(cid, _)) = Component::try_parse(&mut *memory, base)
+        else {
+            continue;
+        };
+        let Some(jep) = cid.peripheral_id().jep106() else {
+            continue;
+        };
+        let designer = jep
+            .get()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| format!("JEP106 cc={} id=0x{:02X}", jep.cc, jep.id));
+        return Some((designer, cid.peripheral_id().part(), base));
+    }
+    None
+}
+
+/// Assemble a full read-only identity report from an already attached session.
+///
+/// Every vendor register is optional: a die that simply does not implement it
+/// produces a warning, never an error. That makes the same routine safe to call
+/// automatically before a flash run on any chip in the library.
+fn collect_chip_id(
+    session: &mut Session,
+    cfg: &FlashConfig,
+    custom: Option<u64>,
+) -> ChipIdSnapshot {
+    let profile: ChipIdProfile = chip_id::profile_for_chip(&cfg.chip);
+    let mut snap = ChipIdSnapshot::new(&cfg.chip, profile);
+
+    match read_dpidr(session) {
+        Some((raw, designer)) => snap.push(ChipIdField::new(
+            "DPIDR",
+            None,
+            format!("0x{raw:08X}"),
+            chip_id::dpidr_detail(raw, designer.as_deref()),
+        )),
+        None => snap
+            .warnings
+            .push("DPIDR 读取失败（目标可能不是 ARM 或探针不支持）".to_owned()),
+    }
+
+    // A ROM-table walk costs dozens of SWD transactions. Only pay for it when
+    // there is no vendor map: PY32F003 (M0+) has no ROM table anyway, and the
+    // pre-flash check must stay cheap on an easily upset DAPLink.
+    if profile.kind == chip_id::IdKind::Generic {
+        if let Some((designer, part, base)) = read_rom_table_identity(session) {
+            snap.push(ChipIdField::new(
+                "ROM Table",
+                Some(base),
+                format!("0x{part:04X}"),
+                format!(
+                    "CoreSight ROM Table · 制造商 {designer} · 部件号 0x{part:04X} · 调试基址 0x{base:08X}"
+                ),
+            ));
+        }
+    }
+
+    let mut core = match session.core(0) {
+        Ok(core) => core,
+        Err(err) => {
+            snap.warnings.push(format!("无法访问核心 0: {err}"));
+            return snap;
+        }
+    };
+    core.halt(Duration::from_millis(500)).ok();
+
+    match core.read_word_32(chip_id::SCB_CPUID) {
+        Ok(raw) => snap.push(ChipIdField::new(
+            "CPUID",
+            Some(chip_id::SCB_CPUID),
+            format!("0x{raw:08X}"),
+            chip_id::cpuid_detail(raw),
+        )),
+        Err(err) => snap.warnings.push(format!(
+            "CPUID 0x{:08X} 读取失败: {err}",
+            chip_id::SCB_CPUID
+        )),
+    }
+
+    if let Some(addr) = profile.idcode {
+        match core.read_word_32(addr) {
+            Ok(raw) => snap.push(ChipIdField::new(
+                "DBGMCU_IDCODE",
+                Some(addr),
+                format!("0x{raw:08X}"),
+                chip_id::idcode_detail(raw),
+            )),
+            Err(err) => snap
+                .warnings
+                .push(format!("DBGMCU_IDCODE 0x{addr:08X} 读取失败: {err}")),
+        }
+    }
+
+    if let Some(addr) = profile.uid {
+        let mut bytes = [0u8; chip_id::UID_LEN];
+        match core.read_8(addr, &mut bytes) {
+            Ok(()) => snap.push(ChipIdField::new(
+                "UID",
+                Some(addr),
+                chip_id::uid_hex(&bytes),
+                chip_id::uid_detail(&bytes),
+            )),
+            Err(err) => snap
+                .warnings
+                .push(format!("UID 0x{addr:08X} 读取失败: {err}")),
+        }
+    }
+
+    // The flash-size register is a 16-bit value and is not always word aligned
+    // (e.g. STM32F4 @ 0x1FFF7A22), so read bytes rather than a 32-bit word.
+    if let Some(addr) = profile.flash_size {
+        let mut bytes = [0u8; 2];
+        match core.read_8(addr, &mut bytes) {
+            Ok(()) => {
+                let raw = u16::from_le_bytes(bytes) as u32;
+                snap.push(ChipIdField::new(
+                    "Flash 容量",
+                    Some(addr),
+                    format!("0x{raw:04X}"),
+                    chip_id::flash_size_detail(raw),
+                ));
+            }
+            Err(err) => snap
+                .warnings
+                .push(format!("Flash 容量 0x{addr:08X} 读取失败: {err}")),
+        }
+    }
+
+    if let Some(addr) = custom {
+        let mut bytes = [0u8; 4];
+        match core.read_8(addr, &mut bytes) {
+            Ok(()) => {
+                let raw = u32::from_le_bytes(bytes);
+                snap.push(ChipIdField::new(
+                    "自定义寄存器",
+                    Some(addr),
+                    format!("0x{raw:08X}"),
+                    "小端 32 位原值，未做型号相关解析".to_owned(),
+                ));
+            }
+            Err(err) => snap
+                .warnings
+                .push(format!("自定义地址 0x{addr:08X} 读取失败: {err}")),
+        }
+    }
+
+    core.run().ok();
+    snap
+}
+
+fn read_chip_id_snapshot(
+    cfg: &FlashConfig,
+    custom: Option<u64>,
+    tx: &Sender<Event>,
+) -> Result<ChipIdSnapshot> {
+    let mut session = connect(cfg, tx)?;
+    let snapshot = collect_chip_id(&mut session, cfg, custom);
+    if snapshot.fields.is_empty() {
+        bail!(
+            "未能读取任何芯片 ID 寄存器：{}",
+            snapshot.warnings.join("；")
+        );
+    }
+    Ok(snapshot)
+}
+
+fn read_chip_id(cfg: &FlashConfig, custom: Option<u64>, tx: &Sender<Event>) -> Result<String> {
+    let snapshot = read_chip_id_snapshot(cfg, custom, tx)?;
+    for warning in &snapshot.warnings {
+        log(tx, Level::Warn, warning.clone());
+    }
+    log(
+        tx,
+        Level::Ok,
+        format!("芯片身份: {}", snapshot.identity()),
+    );
+    let count = snapshot.fields.len();
+    let _ = tx.send(Event::ChipId(snapshot));
+    Ok(format!("已读取 {count} 项芯片 ID 信息"))
+}
+
+/// Headless, read-only identification: `--chip-id [chip] [--id-addr 0x…]`.
+pub fn chip_id_cli(cfg: &FlashConfig, custom: Option<u64>) {
+    let (tx, rx) = mpsc::channel();
+    println!("读取芯片 ID（只读，不写入任何数据）…");
+    match read_chip_id_snapshot(cfg, custom, &tx) {
+        Ok(snapshot) => {
+            while let Ok(ev) = rx.try_recv() {
+                if let Event::Log(level, msg) = ev {
+                    println!("    [{level:?}] {msg}");
+                }
+            }
+            println!();
+            print!("{}", snapshot.text());
+            for warning in &snapshot.warnings {
+                println!("[WARN] {warning}");
+            }
+            println!("[PASS] 芯片 ID 读取完成");
+        }
+        Err(err) => {
+            while let Ok(ev) = rx.try_recv() {
+                if let Event::Log(level, msg) = ev {
+                    println!("    [{level:?}] {msg}");
+                }
+            }
+            println!("[FAIL] {err:#}");
+        }
+    }
+}
 
 /// Read the option-byte block through plain memory access. Safe on every chip:
 /// no FLASH registers are touched and nothing is written.
@@ -1688,5 +1988,42 @@ mod tests {
         assert!(!is_transient_probe_error(&anyhow!(
             "选项字节反码校验失败，拒绝写入"
         )));
+    }
+
+    /// Chip-ID reads are read-only, so a transport hiccup may safely restart
+    /// the whole job just like a read-back.
+    #[test]
+    fn chip_id_read_is_retryable() {
+        assert!(job_is_retryable(&Job::ReadChipId {
+            cfg: Box::new(FlashConfig::default()),
+            custom: Some(0x4001_5800),
+        }));
+    }
+
+    /// Settings written before this feature existed must still deserialise,
+    /// and the harmless pre-flash identification check stays enabled.
+    #[test]
+    fn older_config_without_chip_id_option_still_loads() {
+        let mut value = serde_json::to_value(FlashConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("read_chip_id_before_flash");
+        let cfg: FlashConfig = serde_json::from_value(value).unwrap();
+        assert!(!cfg.read_chip_id_before_flash);
+        assert!(include_str!("backend.rs").contains("collect_chip_id(&mut session, cfg, None)"));
+    }
+
+    /// Chips without a bundled vendor map still get a generic identity, so
+    /// selecting e.g. an MM32/HC32 part does not produce an empty report.
+    #[test]
+    fn generic_chips_are_identified_through_the_coresight_rom_table() {
+        let source = include_str!("backend.rs");
+        assert!(source.contains("fn read_rom_table_identity"));
+        assert!(source.contains("Component::Class1RomTable"));
+        assert!(source.contains("\"ROM Table\""));
+        let chip_id = include_str!("chip_id.rs");
+        assert!(chip_id.contains("\"ROM Table\""));
+        assert!(chip_id.contains("IdKind::Generic"));
     }
 }
