@@ -245,14 +245,9 @@ pub fn dpidr_detail(raw: u32, designer: Option<&str>) -> String {
     )
 }
 
-/// `SCB->CPUID`: implementer / variant / architecture / part number / revision.
-pub fn cpuid_detail(raw: u32) -> String {
-    let implementer = (raw >> 24) & 0xFF;
-    let variant = (raw >> 20) & 0xF;
-    let arch = (raw >> 16) & 0xF;
-    let part = (raw >> 4) & 0xFFF;
-    let revision = raw & 0xF;
-    let core = match part {
+/// Map a CPUID part number to a core name.
+pub fn core_name(part: u32) -> &'static str {
+    match part {
         0xC20 => "Cortex-M0",
         0xC60 => "Cortex-M0+",
         0xC21 => "Cortex-M1",
@@ -264,7 +259,42 @@ pub fn cpuid_detail(raw: u32) -> String {
         0xD22 => "Cortex-M55",
         0xD23 => "Cortex-M85",
         _ => "未知内核（部件号未收录）",
+    }
+}
+
+/// Cross-check the silicon's CPUID against the core declared by the selected
+/// chip description. A wrong model in the chip library is a common reason a
+/// connection test keeps failing; this turns it into an explicit warning.
+/// `expected` is `CoreType`'s Debug name (`"Armv6m"`, `"Armv7m"`, ...).
+pub fn core_mismatch_note(expected: Option<&str>, cpuid: u32) -> Option<String> {
+    let expected = expected?;
+    let part = (cpuid >> 4) & 0xFFF;
+    let ok = match expected.to_ascii_lowercase().as_str() {
+        "armv6m" => matches!(part, 0xC20 | 0xC60 | 0xC21),
+        "armv7m" => part == 0xC23,
+        "armv7em" => matches!(part, 0xC24 | 0xC27),
+        "armv8m" => matches!(part, 0xD20 | 0xD21 | 0xD22 | 0xD23),
+        // Non Cortex-M descriptions cannot be checked with CPUID.
+        _ => true,
     };
+    if ok {
+        None
+    } else {
+        Some(format!(
+            "实测内核 {}（CPUID 部件号 0x{part:03X}）与所选芯片声明的 {expected} 不一致，可能选错了型号",
+            core_name(part)
+        ))
+    }
+}
+
+/// `SCB->CPUID`: implementer / variant / architecture / part number / revision.
+pub fn cpuid_detail(raw: u32) -> String {
+    let implementer = (raw >> 24) & 0xFF;
+    let variant = (raw >> 20) & 0xF;
+    let arch = (raw >> 16) & 0xF;
+    let part = (raw >> 4) & 0xFFF;
+    let revision = raw & 0xF;
+    let core = core_name(part);
     let maker = if implementer == 0x41 {
         "ARM"
     } else {
@@ -347,6 +377,29 @@ mod tests {
         assert!(detail.contains("ARMv6-M"), "{detail}");
         assert!(detail.contains("0xC60"), "{detail}");
         assert!(cpuid_detail(0x410F_C241).contains("Cortex-M4"));
+    }
+
+    #[test]
+    fn core_mismatch_flags_a_wrong_chip_description() {
+        // MM32L373PF is Armv7m (M3, part 0xC23); reading it with an Armv6m
+        // description (e.g. PY32F003x8) must produce an explicit warning.
+        let m3 = 0x412F_C231;
+        assert_eq!(core_name((m3 >> 4) & 0xFFF), "Cortex-M3");
+        assert!(core_mismatch_note(Some("Armv7m"), m3).is_none());
+        let note = core_mismatch_note(Some("armv6m"), m3).unwrap();
+        assert!(note.contains("Cortex-M3"), "{note}");
+        assert!(note.contains("可能选错了型号"), "{note}");
+
+        // A genuine M0+ against an Armv7m description is flagged as well.
+        let m0p = 0x410C_C601;
+        assert!(core_mismatch_note(Some("Armv6m"), m0p).is_none());
+        assert!(core_mismatch_note(Some("Armv7m"), m0p).is_some());
+        assert!(cpuid_detail(0x410F_C241).contains("Cortex-M4"));
+        assert!(core_mismatch_note(Some("Armv7em"), 0x410F_C241).is_none());
+
+        // No declared core / unknown architectures are never guessed at.
+        assert!(core_mismatch_note(None, m3).is_none());
+        assert!(core_mismatch_note(Some("Riscv"), m3).is_none());
     }
 
     #[test]

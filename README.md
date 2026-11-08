@@ -36,6 +36,7 @@ GUI 侧另有兜底：`Connect` / `ReadBack` / `Flash` / `VerifyFirmware` / `Era
 - HEX / ELF / BIN 固件解析（地址区间、记录数、SHA256），支持拖拽载入
 - 一键烧录、库内 verify、独立读回 SHA256 比对、烧录前读回备份、复位运行、整片擦除（二次确认）
 - **不稳定的 DAPLink 容错**：自动跳过错位的 HID 回执与空闲全 0 报告，控制命令重同步，传输类失败按退避自动重试整个幂等任务（详见「两个仓库」）
+- **连接失败可诊断**：`--connect` 是 GUI「连接测试」的无界面等价路径；探针打开失败时重新枚举最多 3 次，错误链区分 HID 固件死锁（需重新插拔）与进程独占（需关闭 pyOCD 等），死锁状态不再无谓重试。芯片 ID 报告还会核对实测内核与所选型号是否一致，型号选错直接给出告警
 - 深浅双主题、SVG 矢量导航图标（运行时用 epaint 直接绘制，无位图纹理）、可折叠日志台、进度与状态栏
 - 配置自动保存到可执行文件同目录的 `probe-rs-studio.json`
 
@@ -408,8 +409,40 @@ OB 区 0x1FFF0E80 · 16 字节
 `probe-rs-studio.json` 持久化，旧配置文件缺少该字段时按关闭处理。所有报告都是
 运行时状态，**不写入配置文件**，重启后不会拿上一次的板子冒充当前芯片。
 
+报告还会把实测 `CPUID` 的部件号与所选芯片描述声明的内核（`Armv6m` / `Armv7m` /
+`Armv7em` / `Armv8m`）做一致性核对。型号选错时不再只是「连接测试一直失败」，而是直接给出
+`[WARN] 实测内核 Cortex-M3 … 与所选芯片声明的 Armv6m 不一致，可能选错了型号`。
+例如在一块 MM32L373PF（Cortex-M3）上误选 `PY32F003x8` 就会触发该提示。
+
 > 芯片 ID 与「选项字节」是两件事：前者只读识别硅片身份，后者会改写配置 NVM。
 > 两者共用同一套连接参数，但读取 ID 不会改变芯片任何内容。
+
+## 连接测试一直失败：DAPLink HID 固件死锁
+
+「连接测试 / 连接 / 烧录」全部卡住，日志里出现 `hidapi error: WinError: WaitTimedOut`
+或 `Command ID in response (0x0) does not match sent command ID`，且**换芯片型号、降速都无效**时，
+通常不是芯片描述错了，而是 DAPLink 的 HID 端点固件死锁。判断方法：
+
+1. 用 `--connect` 复现 GUI 同一条路径（含探针重新枚举与任务级重试），看错误链里的
+   实际原因；`probe-rs` 与 `pyOCD` 都卡在 `DAP_Info` 即可确认是探针侧问题。
+2. 检查是否有别的进程占着探针：`pyOCD` / OpenOCD / 另一个 probe-rs / 备份脚本。
+   结束这些进程（例如残留的 `python3.13.exe` 备份任务）后重试。
+3. 若仍然零响应，需要让探针**重新上电枚举**：直接重新插拔 USB 最可靠。
+   本机受系统策略限制时 `pnputil /restart-device`、禁用/启用 HID 接口、
+   `CM_Reenumerate_DevNode` 都可能返回 `CR_ACCESS_DENIED`；CDC 虚拟串口的
+   1200bps/DTR 复位也不一定有效。对**外置 USB Hub**（本机 `VID_05E3&PID_0608`）
+   的对应端口下发 `IOCTL_USB_HUB_CYCLE_PORT` 做电气复位可以等效于物理插拔。
+   恢复后 `--connect` 会立即 `[PASS]`。
+
+软件侧为此做的改进：
+
+- 错误提示区分「探针固件无响应（HID 超时，需重新插拔）」和「被其它程序独占（关闭
+  pyOCD 等）」，不再把超时笼统说成占用。用 `anyhow` 展开 `DebugProbeError` 的
+  完整 cause chain，日志里能看到真正的 `WinError`。
+- `open_probe()` 每次尝试都重新 `Lister::new()` / `list_all()`，最多 3 次（400/800 ms 退避），
+  按稳定身份匹配探针；重新插拔后身份变化且只发现一个探针时自动改用它。
+- 确认探针已死锁后返回 `ProbeUnresponsive`，该错误**不进入**任务级退避重试，
+  避免把同一个无望的连接重复 9 次才报错。
 
 ## 自检与诊断
 
@@ -448,8 +481,13 @@ probe-rs-studio.exe --chip-id
 probe-rs-studio.exe --chip-id PY32F003x8 --speed 10000
 probe-rs-studio.exe --chip-id MM32L373PF --id-addr 0x40015800
 
-# 启动 GUI 并直接打开「选项字节设置」窗口
+# 无界面连接测试：复用配置里的探针身份与速度，走 GUI「连接测试」同一路径
+probe-rs-studio.exe --connect
+probe-rs-studio.exe --connect MM32L373PF --speed 10000
+
+# 启动 GUI 并直接打开「选项字节设置」/「目标芯片 ID」窗口
 probe-rs-studio.exe --ob-open
+probe-rs-studio.exe --id-open
 
 # 单元测试（hex 查看器、pack 转换、串口枚举 / 参数 / HEX 解析、定时发送、缩放、快捷输入、
 # 选项字节编解码与反码、芯片 ID 解码与预设、探针任务重试策略、矢量图标、主题配色、
@@ -470,6 +508,15 @@ cargo test --release --bin probe-rs-studio
   （备份 → 烧录 4111 字节 → 独立读回 SHA256 比对）零重试通过，`[PASS] 读回完全一致`。
 - DAPLink 虚拟串口 `COM10`（`c251:f001`，`MI_00`）：识别为「调试器虚拟串口」；**TX/RX 短接回环**
   115200 8N1 下文本 / HEX / 彩色 emoji 发送与接收、定时发送、Ctrl+滚轮缩放全部验证通过
+- 芯片 ID（v0.2.1）：窗口渲染、寄存器解码与内核一致性单测（88 项）、CLI 接线已验证；
+  采集路径与 `--option-bytes` 共用连接层，为纯只读。若探针被其它调试工具独占，
+  `DAP_Info` 会返回 `WinError: WaitTimedOut`；释放探针或重新插拔 USB 后执行 `--chip-id` 即可核对。
+- **MM32L373PF**（MindMotion DFP 扩展包，Cortex-M3 / 128KB Flash，10000 kHz）：
+  死锁恢复后 `--connect` 连续 3 次 `[PASS]`，向量表 `SP=0x20000900 PC=0x080032D5`；
+  `--chip-id` 真机读到 `DPIDR=0x2BA01477`、ROM Table `0xE00FF000=0x04C3`、
+  `CPUID=0x412FC231`（ARM Cortex-M3 / ARMv7-M，与芯片描述 `Armv7m` 一致，无告警）；
+  `--chip-id --id-addr 0xE0042000` 自定义地址读到 `0x00000000`。
+  故意误选 `PY32F003x8` 时正确给出 `[WARN] … 与所选芯片声明的 Armv6m 不一致`。
 - 选项字节：`--option-bytes` 在 10000 kHz 下只读读出 `0x1FFF0E80` 的 16 字节，
   反码校验通过，字段解析与厂商 SDK 位定义一致；GUI 窗口渲染、字段编辑与风险护栏已验证。
   **写入路径未做真机执行验证**（避免误锁芯片），见上文说明。
@@ -481,10 +528,10 @@ cargo test --release --bin probe-rs-studio
 ## 目录结构
 
 ```
-src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --ob-open / --id-open 分派
+src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --connect / --ob-open / --id-open 分派
 src/app.rs        会话侧栏、16 进制查看器、串口终端（定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、选项字节与芯片 ID 窗口、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
-src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
-src/chip_id.rs    芯片 ID 寄存器预设与 CPUID / DPIDR / IDCODE / UID / FlashSize 解码、报告格式化（纯逻辑，可单测）
+src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、内核一致性核对、探针重新枚举与死锁识别、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
+src/chip_id.rs    芯片 ID 寄存器预设与 CPUID / DPIDR / IDCODE / UID / FlashSize 解码、内核型号与芯片描述一致性判定、报告格式化（纯逻辑，可单测）
 src/option_bytes.rs  选项字节 16 字节镜像、字段编解码、反码维护、变更 diff 与安全校验（纯逻辑，可单测）
 src/pack.rs       CMSIS-Pack 转换器：ZIP / pdsc XML / ELF32 FLM / target YAML（纯 Rust）
 src/firmware.rs   HEX / ELF / BIN 解析与 SHA256

@@ -21,7 +21,7 @@ use probe_rs::{
         self, BinLoader, BinOptions, DownloadOptions, ElfLoader, ElfOptions, FlashProgress,
         HexLoader, ProgressEvent,
     },
-    probe::{list::Lister, DebugProbeInfo, WireProtocol},
+    probe::{list::Lister, DebugProbeInfo, Probe, WireProtocol},
     MemoryInterface, Permissions, Session,
 };
 use sha2::{Digest, Sha256};
@@ -334,9 +334,32 @@ fn job_is_retryable(job: &Job) -> bool {
     )
 }
 
+/// A probe whose HID endpoint stopped answering altogether. Replaying the
+/// whole job cannot fix this (the device needs a power cycle / re-enumeration),
+/// so it is deliberately excluded from `is_transient_probe_error`.
+#[derive(Debug)]
+struct ProbeUnresponsive(String);
+
+impl std::fmt::Display for ProbeUnresponsive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "探针固件无响应（HID 超时）· 请重新插拔 DAPLink USB 让它重新上电；\
+             若刚用过 pyOCD / OpenOCD / 其它调试工具，请确认它们已退出。\
+             这种状态只靠重试命令无法恢复，需要探针重新枚举\n原始错误：{}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ProbeUnresponsive {}
+
 /// Only transport-level hiccups justify a retry. A missing firmware file, a
 /// failed verification or a rejected option-byte image must surface at once.
 fn is_transient_probe_error(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<ProbeUnresponsive>().is_some() {
+        return false;
+    }
     let text = format!("{err:#}").to_lowercase();
     const HINTS: &[&str] = &[
         "command id in response",
@@ -1065,26 +1088,106 @@ fn connect(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<Session> {
 /// `session.target()`, so this is what makes an OB address programmable: the
 /// main Flash algorithm does not cover 0x1FFF0E80, but the vendor's dedicated
 /// `*_OPT.FLM` does. The extra algorithm lives only for this one session.
-fn connect_with(cfg: &FlashConfig, tx: &Sender<Event>, attach_ob: bool) -> Result<Session> {
+/// Whether a failed `Lister::open()` is a transient probe-level hiccup worth
+/// re-enumerating for. A genuinely missing probe or a bad USB descriptor is not.
+fn is_probe_open_transient(err: &str) -> bool {
+    is_transient_probe_error(&anyhow!("{err}"))
+}
+
+/// Turn the raw probe error into an actionable message. In particular, a
+/// `WinError: WaitTimedOut` means the DAPLink firmware stopped answering, NOT
+/// that another program holds the device; telling the user to close other
+/// programs sends them down the wrong path.
+fn probe_open_hint(err: &str) -> &'static str {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("waittimedout") || lower.contains("timed out") || lower.contains("timeout") {
+        "探针固件无响应（HID 超时）· 请重新插拔 DAPLink USB 让它重新上电；\
+         若刚用过 pyOCD / OpenOCD / 其它调试工具，请确认它们已退出。\
+         这种状态只靠重试命令无法恢复，需要探针重新枚举"
+    } else if lower.contains("access is denied")
+        || lower.contains("getlasterror=5")
+        || lower.contains("sharing violation")
+    {
+        "探针被其它程序独占 · 请关闭 pyOCD / OpenOCD / 其它 probe-rs 实例后重试"
+    } else {
+        "打开探针失败"
+    }
+}
+
+/// Open the selected probe, re-enumerating between attempts.
+///
+/// A DAPLink that dropped its HID queue often becomes usable again after the
+/// host re-enumerates it (or after the user replugs it). Retrying on the same
+/// `Lister` snapshot cannot see that, so each attempt calls `list_all()` again
+/// and resolves the probe by its stable identity rather than by index.
+fn open_probe(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<Probe> {
+    const ATTEMPTS: usize = 3;
     let lister = Lister::new();
-    let probes = lister.list_all();
-    // Prefer the stable device identity: enumeration indices shift whenever a
-    // probe is unplugged, so an index alone could attach to the wrong device.
-    let info = match cfg.probe_id.as_deref() {
-        Some(id) if !id.is_empty() => probes
-            .iter()
-            .find(|p| probe_identity(p) == id)
-            .ok_or_else(|| anyhow!("所选调试探针已断开，请在「设备」页重新选择"))?,
-        _ => probes
-            .get(cfg.probe_index)
-            .ok_or_else(|| anyhow!("探针索引 {} 不存在，请先刷新探针列表", cfg.probe_index))?,
-    };
-    log(
-        tx,
-        Level::Info,
-        format!("打开探针: {} [{:04x}:{:04x}]", info.identifier, info.vendor_id, info.product_id),
-    );
-    let mut probe = lister.open(info).context("打开探针失败（可能被其它程序占用）")?;
+    for attempt in 1..=ATTEMPTS {
+        let probes = lister.list_all();
+        // Prefer the stable device identity: enumeration indices shift whenever
+        // a probe is unplugged, so an index alone could attach to a wrong device.
+        // After a replug the identity may change; if exactly one probe is left,
+        // it is unambiguous and safe to use it.
+        let found = match cfg.probe_id.as_deref() {
+            Some(id) if !id.is_empty() => probes.iter().find(|p| probe_identity(p) == id),
+            _ => probes.get(cfg.probe_index),
+        };
+        let info = match found {
+            Some(info) => info,
+            None if probes.len() == 1 => {
+                log(
+                    tx,
+                    Level::Warn,
+                    "保存的探针身份已变化（可能刚重新插拔），当前仅发现一个探针，自动改用它",
+                );
+                &probes[0]
+            }
+            None => bail!("所选调试探针已断开，请在「设备」页重新选择（当前发现 {} 个探针）", probes.len()),
+        };
+        log(
+            tx,
+            Level::Info,
+            format!(
+                "打开探针: {} [{:04x}:{:04x}]{}",
+                info.identifier,
+                info.vendor_id,
+                info.product_id,
+                if attempt > 1 { format!(" · 第 {attempt} 次尝试") } else { String::new() }
+            ),
+        );
+        match lister.open(info) {
+            Ok(probe) => return Ok(probe),
+            Err(err) => {
+                // DebugProbeError's Display is only the top-level message;
+                // wrapping in anyhow and using `{:#}` prints the whole cause
+                // chain (including hidapi's WinError), which is what the hint
+                // and retry classifier need to see.
+                let wrapped = anyhow::Error::from(err);
+                let text = format!("{wrapped:#}");
+                if attempt == ATTEMPTS {
+                    return Err(ProbeUnresponsive(text).into());
+                }
+                if !is_probe_open_transient(&text) {
+                    bail!("{}\n原始错误：{text}", probe_open_hint(&text));
+                }
+                log(
+                    tx,
+                    Level::Warn,
+                    format!(
+                        "探针打开失败（第 {attempt}/{ATTEMPTS} 次），{} ms 后重新枚举重试：{text}",
+                        400 * attempt
+                    ),
+                );
+                std::thread::sleep(Duration::from_millis(400 * attempt as u64));
+            }
+        }
+    }
+    unreachable!("open_probe always returns or bails")
+}
+
+fn connect_with(cfg: &FlashConfig, tx: &Sender<Event>, attach_ob: bool) -> Result<Session> {
+    let mut probe = open_probe(cfg, tx)?;
 
     let protocol = match cfg.protocol {
         Protocol::Swd => WireProtocol::Swd,
@@ -1499,6 +1602,16 @@ fn collect_chip_id(
         }
     }
 
+    // The selected chip description declares a core type (Armv6m / Armv7m /
+    // ...). Compare it with the silicon's CPUID so a wrong model in the chip
+    // library is called out instead of silently producing a confusing flash
+    // failure. Read this before `session.core(0)` takes a mutable borrow.
+    let expected_core = session
+        .target()
+        .cores
+        .first()
+        .map(|c| format!("{:?}", c.core_type));
+
     let mut core = match session.core(0) {
         Ok(core) => core,
         Err(err) => {
@@ -1509,12 +1622,17 @@ fn collect_chip_id(
     core.halt(Duration::from_millis(500)).ok();
 
     match core.read_word_32(chip_id::SCB_CPUID) {
-        Ok(raw) => snap.push(ChipIdField::new(
-            "CPUID",
-            Some(chip_id::SCB_CPUID),
-            format!("0x{raw:08X}"),
-            chip_id::cpuid_detail(raw),
-        )),
+        Ok(raw) => {
+            snap.push(ChipIdField::new(
+                "CPUID",
+                Some(chip_id::SCB_CPUID),
+                format!("0x{raw:08X}"),
+                chip_id::cpuid_detail(raw),
+            ));
+            if let Some(note) = chip_id::core_mismatch_note(expected_core.as_deref(), raw) {
+                snap.warnings.push(note);
+            }
+        }
         Err(err) => snap.warnings.push(format!(
             "CPUID 0x{:08X} 读取失败: {err}",
             chip_id::SCB_CPUID
@@ -1623,6 +1741,23 @@ fn read_chip_id(cfg: &FlashConfig, custom: Option<u64>, tx: &Sender<Event>) -> R
     Ok(format!("已读取 {count} 项芯片 ID 信息"))
 }
 
+/// Headless equivalent of the GUI's「连接测试」button. Uses `run()` so it also
+/// exercises the job-level probe retry policy, not just the raw library call.
+pub fn connect_cli(cfg: &FlashConfig) {
+    let (tx, rx) = mpsc::channel();
+    println!("连接测试: {} · {} kHz", cfg.chip, cfg.speed_khz);
+    let result = run(Job::Connect(Box::new(cfg.clone())), &tx);
+    while let Ok(ev) = rx.try_recv() {
+        if let Event::Log(level, msg) = ev {
+            println!("    [{level:?}] {msg}");
+        }
+    }
+    match result {
+        Ok(summary) => println!("[PASS] {summary}"),
+        Err(err) => println!("[FAIL] {err:#}"),
+    }
+}
+
 /// Headless, read-only identification: `--chip-id [chip] [--id-addr 0x…]`.
 pub fn chip_id_cli(cfg: &FlashConfig, custom: Option<u64>) {
     let (tx, rx) = mpsc::channel();
@@ -1635,10 +1770,9 @@ pub fn chip_id_cli(cfg: &FlashConfig, custom: Option<u64>) {
                 }
             }
             println!();
+            // `ChipIdSnapshot::text()` already renders every `[WARN]` row;
+            // printing `snapshot.warnings` again would duplicate them.
             print!("{}", snapshot.text());
-            for warning in &snapshot.warnings {
-                println!("[WARN] {warning}");
-            }
             println!("[PASS] 芯片 ID 读取完成");
         }
         Err(err) => {
@@ -2012,6 +2146,61 @@ mod tests {
         let cfg: FlashConfig = serde_json::from_value(value).unwrap();
         assert!(!cfg.read_chip_id_before_flash);
         assert!(include_str!("backend.rs").contains("collect_chip_id(&mut session, cfg, None)"));
+    }
+
+    /// `ChipIdSnapshot::text()` owns warning rendering; the CLI must not
+    /// print the same `[WARN]` lines a second time.
+    #[test]
+    fn chip_id_cli_does_not_duplicate_warnings() {
+        let source = include_str!("backend.rs");
+        let body = source.split("pub fn chip_id_cli").nth(1).unwrap();
+        assert!(!body.contains("for warning in &snapshot.warnings"));
+        assert!(include_str!("chip_id.rs").contains("[WARN] {warning}"));
+    }
+
+    /// The chip-ID report must cross-check CPUID against the core declared by
+    /// the selected target, otherwise a wrong model stays invisible.
+    #[test]
+    fn chip_id_report_checks_core_consistency() {
+        let source = include_str!("backend.rs");
+        assert!(source.contains("let expected_core = session"));
+        assert!(source.contains("chip_id::core_mismatch_note(expected_core.as_deref(), raw)"));
+        assert!(include_str!("chip_id.rs").contains("pub fn core_mismatch_note"));
+        // The check runs on the successful CPUID read only, never on failure.
+        let block = source.split("match core.read_word_32(chip_id::SCB_CPUID)").nth(1).unwrap();
+        assert!(block.contains("core_mismatch_note"));
+    }
+
+    /// A probe with a dead HID endpoint must produce an actionable message
+    /// immediately, not nine futile retries of the same connection attempt.
+    #[test]
+    fn unresponsive_probe_is_not_replayed_and_has_an_actionable_hint() {
+        let raw = "hidapi error: WinError: WaitTimedOut";
+        let err: anyhow::Error = ProbeUnresponsive(raw.to_owned()).into();
+        assert!(!is_transient_probe_error(&err));
+        let text = format!("{err:#}");
+        assert!(text.contains("重新插拔 DAPLink USB"), "{text}");
+        assert!(text.contains(raw), "{text}");
+        assert!(is_probe_open_transient(raw));
+        assert!(probe_open_hint(raw).contains("重新插拔"));
+        assert!(probe_open_hint("GetLastError=5").contains("独占"));
+        assert_eq!(probe_open_hint("descriptor parse failed"), "打开探针失败");
+    }
+
+    /// The GUI「连接测试」has a headless twin, and probe opening re-enumerates
+    /// instead of retrying on a stale `Lister` snapshot.
+    #[test]
+    fn connection_test_and_probe_open_recovery_are_wired() {
+        let source = include_str!("backend.rs");
+        for needle in [
+            "fn open_probe",
+            "list_all()",
+            "pub fn connect_cli",
+            "ProbeUnresponsive",
+        ] {
+            assert!(source.contains(needle), "missing probe recovery: {needle}");
+        }
+        assert!(include_str!("main.rs").contains("--connect"));
     }
 
     /// Chips without a bundled vendor map still get a generic identity, so

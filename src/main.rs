@@ -143,6 +143,20 @@ fn main() -> eframe::Result<()> {
         std::process::exit(0);
     }
 
+    // Headless connection test: exactly the path behind the GUI「连接测试」
+    // button, including the probe-open recovery and job-level retries.
+    if let Some(pos) = args.iter().position(|a| a == "--connect") {
+        let mut cfg = saved_flash_config().unwrap_or_default();
+        if let Some(chip) = args.get(pos + 1).filter(|s| !s.starts_with("--")) {
+            cfg.chip = chip.clone();
+        }
+        if let Some(speed) = cli_opt(&args, "--speed").and_then(|s| s.parse::<u32>().ok()) {
+            cfg.speed_khz = speed;
+        }
+        backend::connect_cli(&cfg);
+        std::process::exit(0);
+    }
+
     // Headless, READ-ONLY target identification:
     //   --chip-id [chip] [--speed N] [--id-addr 0x40015800]
     if let Some(pos) = args.iter().position(|a| a == "--chip-id") {
