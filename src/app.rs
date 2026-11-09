@@ -4044,8 +4044,8 @@ impl App {
                 ui.add_space(10.0);
                 // Chat-input style footer: a hint on the left and a round
                 // accent send button pinned to the bottom-right corner. The
-                // arrow is drawn as vector shapes, so it never depends on an
-                // emoji font falling back to a coloured square.
+                // paper plane is pure vector shapes, so it never depends on
+                // an emoji font falling back to a coloured square.
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("Ctrl + Enter 快捷发送")
@@ -4069,23 +4069,27 @@ impl App {
                             }
                             let c = rect.center();
                             let fg = if open { Color32::WHITE } else { p.text3 };
-                            ui.painter().add(egui::Shape::convex_polygon(
-                                vec![
-                                    c + Vec2::new(0.0, -8.0),
-                                    c + Vec2::new(7.0, 1.0),
-                                    c + Vec2::new(-7.0, 1.0),
-                                ],
-                                fg,
-                                egui::epaint::PathStroke::NONE,
+                            // Two filled wings share a crease: a classic paper
+                            // plane with a V-shaped notch at the tail. The
+                            // circle's own colour separates the wings.
+                            let nose = c + Vec2::new(9.0, 0.0);
+                            let tail_top = c + Vec2::new(-8.0, -7.0);
+                            let tail_bottom = c + Vec2::new(-8.0, 7.0);
+                            let tail_mid = c + Vec2::new(-2.0, 0.0);
+                            for wing in [
+                                [tail_top, nose, tail_mid],
+                                [tail_mid, nose, tail_bottom],
+                            ] {
+                                ui.painter().add(egui::Shape::convex_polygon(
+                                    wing.to_vec(),
+                                    fg,
+                                    egui::epaint::PathStroke::NONE,
+                                ));
+                            }
+                            ui.painter().add(egui::Shape::line_segment(
+                                [tail_mid, nose],
+                                Stroke::new(1.0, bg),
                             ));
-                            ui.painter().rect_filled(
-                                Rect::from_center_size(
-                                    c + Vec2::new(0.0, 6.0),
-                                    Vec2::new(3.0, 8.0),
-                                ),
-                                0.0,
-                                fg,
-                            );
                             let resp = resp.on_hover_text("发送（Ctrl + Enter）");
                             if open && resp.clicked() {
                                 send = true;
@@ -5013,6 +5017,9 @@ mod tests {
         for needle in [
             "circle_filled",
             "convex_polygon",
+            "line_segment",
+            "paper plane",
+            "tail_mid",
             "发送（Ctrl + Enter）",
         ] {
             assert!(body.contains(needle), "round send button missing {needle}");
