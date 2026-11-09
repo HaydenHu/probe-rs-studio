@@ -1344,7 +1344,7 @@ impl App {
 
     fn draw_sidebar(&mut self, root: &mut egui::Ui, p: Palette) {
         egui::Panel::left("sidebar")
-            .exact_size(248.0)
+            .exact_size(272.0)
             .resizable(false)
             .frame(Frame::new().fill(p.sidebar).inner_margin(14.0))
             .show(root, |ui| match self.nav {
@@ -1427,6 +1427,9 @@ impl App {
             .selected_text(RichText::new(selected).size(10.5).color(p.text))
             .width(w)
             .show_ui(ui, |ui| {
+                // The sidebar is deliberately narrow, but probe names (and the
+                // elaphureLink entry) are long; give the popup room of its own.
+                ui.set_width(320.0);
                 if self.probes.is_empty() {
                     ui.label(RichText::new("请插入调试器").size(10.0).color(p.text3));
                 }
@@ -4069,16 +4072,16 @@ impl App {
                             }
                             let c = rect.center();
                             let fg = if open { Color32::WHITE } else { p.text3 };
-                            // Two filled wings share a crease: a classic paper
-                            // plane with a V-shaped notch at the tail. The
-                            // circle's own colour separates the wings.
-                            let nose = c + Vec2::new(9.0, 0.0);
-                            let tail_top = c + Vec2::new(-8.0, -7.0);
-                            let tail_bottom = c + Vec2::new(-8.0, 7.0);
-                            let tail_mid = c + Vec2::new(-2.0, 0.0);
+                            // Two filled wings share a crease: a paper plane
+                            // pointing UP, with a V-shaped notch at its tail.
+                            // The circle's own colour separates the wings.
+                            let nose = c + Vec2::new(0.0, -9.0);
+                            let tail_left = c + Vec2::new(-7.0, 8.0);
+                            let tail_right = c + Vec2::new(7.0, 8.0);
+                            let tail_mid = c + Vec2::new(0.0, 2.0);
                             for wing in [
-                                [tail_top, nose, tail_mid],
-                                [tail_mid, nose, tail_bottom],
+                                [tail_left, nose, tail_mid],
+                                [tail_mid, nose, tail_right],
                             ] {
                                 ui.painter().add(egui::Shape::convex_polygon(
                                     wing.to_vec(),
@@ -5024,6 +5027,8 @@ mod tests {
         ] {
             assert!(body.contains(needle), "round send button missing {needle}");
         }
+        assert!(body.contains("pointing UP"));
+        assert!(body.contains("Vec2::new(0.0, -9.0)"));
         assert!(
             body.contains("建议勾选 HEX 显示"),
             "garbled text must point at the HEX view"
@@ -5139,6 +5144,16 @@ mod tests {
             .join("app-icon.res");
         assert!(res.exists(), "missing icon resource: {}", res.display());
         assert!(include_str!("../tools/gen_icons.py").contains("def make_ico("));
+    }
+
+
+    /// The probe dropdown gets its own width so long probe names (and the
+    /// elaphureLink entry) are not squeezed into the narrow sidebar.
+    #[test]
+    fn probe_dropdown_is_wide_enough() {
+        let source = include_str!("app.rs");
+        assert!(source.contains("exact_size(272.0)"));
+        assert!(source.contains("ui.set_width(320.0)"));
     }
 
 }
