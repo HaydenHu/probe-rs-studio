@@ -5,7 +5,9 @@ edition = "2021"
 description = "A DSH-style desktop flashing workbench built directly on the probe-rs library"
 
 [dependencies]
-eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+# `clipboard` is a default feature; with default-features = false eframe falls
+# back to an app-local clipboard, so Ctrl+C / CopyText never reaches Windows.
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "clipboard"] }
 egui = "0.37"
 # egui 0.37 can rasterise COLR/CBDT colour emoji, but the feature lives on
 # epaint and is NOT re-exported by egui/eframe. Enabling it directly on the

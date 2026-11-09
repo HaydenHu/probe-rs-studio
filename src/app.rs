@@ -1038,6 +1038,32 @@ impl App {
         self.recent.truncate(8);
     }
 
+    /// Anything worth offering a "close" button for. A file whose parsing
+    /// failed still owns a raw-byte preview, so it must be removable too.
+    fn has_firmware(&self) -> bool {
+        self.cfg.firmware.is_some() || self.firmware.is_some() || self.firmware_view.is_some()
+    }
+
+    /// Unload the current firmware. Taking `cfg.firmware` also stops the app
+    /// from silently restoring that file on the next launch. The recent-file
+    /// history is deliberately kept so the user can reload it with one click.
+    fn clear_firmware(&mut self) {
+        if !self.has_firmware() {
+            return;
+        }
+        let removed = self.cfg.firmware.take();
+        self.firmware = None;
+        self.firmware_view = None;
+        self.hex_source = HexSource::Image;
+        match removed {
+            Some(path) => self.push_log(
+                Level::Info,
+                format!("已移除固件: {}（16 进制查看器已清空）", path.display()),
+            ),
+            None => self.push_log(Level::Info, "已清空固件预览"),
+        }
+    }
+
     fn open_serial(&mut self) {
         if self.serial_open {
             return;
@@ -1331,6 +1357,25 @@ impl App {
             });
         });
         ui.add_space(8.0);
+        // Flashing is the single most used action. Pin it above the scroll
+        // area so it stays reachable no matter how far the settings are
+        // scrolled; there is deliberately no duplicate button further down.
+        let can_flash = self.can_run() && self.firmware.is_some();
+        let hint = if self.firmware.is_none() {
+            "请先载入固件，再连接调试探针"
+        } else if !self.can_run() {
+            "需等待当前任务结束并确认探针就绪"
+        } else {
+            "固定在侧栏顶部，滚动设置时依然可见"
+        };
+        let full = ui.available_width();
+        if Self::sidebar_button(ui, p, "开始烧录", can_flash, true, full)
+            .on_hover_text(hint)
+            .clicked()
+        {
+            self.start_job(Job::Flash(Box::new(self.cfg.clone())), "烧录固件");
+        }
+        ui.add_space(10.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1460,7 +1505,23 @@ impl App {
     }
 
     fn session_firmware(&mut self, ui: &mut Ui, p: Palette) {
-        Self::section_title(ui, p, "固件文件");
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            Self::section_title(ui, p, "固件文件");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let btn = egui::Button::new(RichText::new("✕ 移除").size(10.0).color(p.error))
+                    .fill(p.card_alt)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .min_size(Vec2::new(0.0, 22.0));
+                if ui
+                    .add_enabled(self.has_firmware(), btn)
+                    .on_hover_text("移除当前固件并清空右侧 16 进制查看器（保留最近固件记录）")
+                    .clicked()
+                {
+                    clear = true;
+                }
+            });
+        });
         ui.add_space(6.0);
         let w = ui.available_width();
         let mut picked: Option<PathBuf> = None;
@@ -1468,6 +1529,9 @@ impl App {
             picked = with_all_files(rfd::FileDialog::new())
                 .add_filter("固件", &["hex", "ihex", "elf", "axf", "out", "bin"])
                 .pick_file();
+        }
+        if clear {
+            self.clear_firmware();
         }
         if let Some(path) = picked {
             self.set_firmware(path);
@@ -1544,14 +1608,8 @@ impl App {
         ui.checkbox(&mut self.cfg.chip_erase, "整片擦除");
         ui.checkbox(&mut self.cfg.read_chip_id_before_flash, "烧录前读取芯片 ID")
             .on_hover_text("在同一连接内只读 DPIDR / CPUID / 厂商 IDCODE / UID，并记录到日志，不中断烧录");
+        // 烧录主按钮已固定在侧栏顶部（不随滚动），此处不再重复放置。
         ui.add_space(8.0);
-        let full = ui.available_width();
-        if Self::sidebar_button(ui, p, "开始烧录", self.can_run() && self.firmware.is_some(), true, full)
-            .clicked()
-        {
-            self.start_job(Job::Flash(Box::new(self.cfg.clone())), "烧录固件");
-        }
-        ui.add_space(6.0);
         let half = (ui.available_width() - 6.0) / 2.0;
         ui.horizontal(|ui| {
             if Self::sidebar_button(ui, p, "独立校验", self.can_run() && self.firmware.is_some(), false, half).clicked() {
@@ -1651,7 +1709,26 @@ impl App {
     }
 
     fn session_recents(&mut self, ui: &mut Ui, p: Palette) {
-        Self::section_title(ui, p, "最近固件");
+        let mut load: Option<PathBuf> = None;
+        let mut remove: Option<PathBuf> = None;
+        let mut clear_all = false;
+        ui.horizontal(|ui| {
+            Self::section_title(ui, p, "最近固件");
+            if !self.recent.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let btn = egui::Button::new(RichText::new("清空").size(9.0).color(p.text3))
+                        .fill(Color32::TRANSPARENT)
+                        .min_size(Vec2::new(0.0, 18.0));
+                    if ui
+                        .add(btn)
+                        .on_hover_text("清空最近固件记录（不影响当前已载入的固件）")
+                        .clicked()
+                    {
+                        clear_all = true;
+                    }
+                });
+            }
+        });
         ui.add_space(6.0);
         if self.recent.is_empty() {
             ui.label(RichText::new("暂无记录").size(10.0).color(p.text3));
@@ -1662,13 +1739,40 @@ impl App {
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_default();
-            if ui
-                .add(egui::Button::new(RichText::new(name).size(10.0).color(p.text2)).fill(Color32::TRANSPARENT))
-                .on_hover_text(path.display().to_string())
-                .clicked()
-            {
-                self.set_firmware(path);
-            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new(name).size(10.0).color(p.text2))
+                            .fill(Color32::TRANSPARENT),
+                    )
+                    .on_hover_text(path.display().to_string())
+                    .clicked()
+                {
+                    load = Some(path.clone());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let btn = egui::Button::new(RichText::new("✕").size(9.0).color(p.text3))
+                        .fill(Color32::TRANSPARENT)
+                        .min_size(Vec2::new(18.0, 18.0));
+                    if ui
+                        .add(btn)
+                        .on_hover_text(format!("从最近固件记录中移除：{}", path.display()))
+                        .clicked()
+                    {
+                        remove = Some(path.clone());
+                    }
+                });
+            });
+        }
+        if clear_all {
+            self.recent.clear();
+            self.push_log(Level::Info, "已清空最近固件记录");
+        } else if let Some(path) = remove {
+            self.recent.retain(|p| p != &path);
+            self.push_log(Level::Info, format!("已从最近固件移除: {}", path.display()));
+        }
+        if let Some(path) = load {
+            self.set_firmware(path);
         }
         ui.add_space(12.0);
         Self::section_title(ui, p, "快捷操作");
@@ -2169,6 +2273,9 @@ impl App {
         ui.add_space(8.0);
         if ui.button("清空日志").clicked() {
             self.logs.clear();
+        }
+        if ui.button("复制全部日志").clicked() {
+            self.copy_all_logs(ui.ctx());
         }
         if ui.button("导出日志").clicked() {
             self.export_logs();
@@ -3109,6 +3216,27 @@ impl App {
         }
     }
 
+    /// Plain-text log shared by clipboard copy and file export. With
+    /// `include_debug = false`, hidden DEBUG rows are left out so the copied
+    /// text matches exactly what the console is currently showing.
+    fn log_text(&self, include_debug: bool) -> String {
+        logs_to_text(&self.logs, include_debug)
+    }
+
+    /// Copy the visible log to the system clipboard. egui can select label
+    /// text, but a Windows-subsystem window does not always deliver Ctrl+C as
+    /// an `Event::Copy`, so an explicit button is the reliable path.
+    fn copy_all_logs(&mut self, ctx: &egui::Context) {
+        let count = self
+            .logs
+            .iter()
+            .filter(|l| self.show_debug || l.level != Level::Debug)
+            .count();
+        let text = self.log_text(self.show_debug);
+        ctx.copy_text(text);
+        self.push_log(Level::Info, format!("已复制 {count} 条日志到剪贴板"));
+    }
+
     fn export_logs(&mut self) {
         let Some(path) = with_all_files(
             rfd::FileDialog::new().add_filter("日志", &["txt", "log"]),
@@ -3118,12 +3246,7 @@ impl App {
         else {
             return;
         };
-        let text = self
-            .logs
-            .iter()
-            .map(|l| format!("[{}] [{}] {}", l.time, level_label(l.level), l.msg))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text = self.log_text(true);
         match fs::write(&path, text) {
             Ok(_) => self.push_log(Level::Ok, format!("日志已导出: {}", path.display())),
             Err(e) => self.push_log(Level::Error, format!("导出失败: {e}")),
@@ -3148,6 +3271,7 @@ impl App {
     /// settings and actions live in the narrow "当前会话" sidebar.
     fn draw_hex_viewer(&mut self, ui: &mut Ui, p: Palette) {
         let mut picked: Option<PathBuf> = None;
+        let mut clear = false;
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("固件 16 进制查看器")
@@ -3156,6 +3280,12 @@ impl App {
                     .color(p.text),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if Self::ghost_button(ui, p, "✕ 关闭固件", self.has_firmware())
+                    .on_hover_text("移除当前固件并清空查看器（保留最近固件记录）")
+                    .clicked()
+                {
+                    clear = true;
+                }
                 if Self::ghost_button(ui, p, "浏览…", true).clicked() {
                     picked = with_all_files(rfd::FileDialog::new())
                         .add_filter("固件", &["hex", "ihex", "elf", "axf", "out", "bin"])
@@ -3163,6 +3293,9 @@ impl App {
                 }
             });
         });
+        if clear {
+            self.clear_firmware();
+        }
         if let Some(path) = picked {
             self.set_firmware(path);
         }
@@ -3357,6 +3490,7 @@ impl App {
             .size_range(90.0..=420.0)
             .frame(Frame::new().fill(p.bg).inner_margin(egui::Margin::symmetric(16, 8)))
             .show(root, |ui| {
+                let mut copy_all = false;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("运行日志").size(12.0).strong().color(p.text));
                     ui.label(
@@ -3371,9 +3505,19 @@ impl App {
                         if ui.button("清空").clicked() {
                             self.logs.clear();
                         }
+                        if ui
+                            .button("复制全部")
+                            .on_hover_text("把当前显示的日志按时间顺序复制到剪贴板；单条日志可右键复制")
+                            .clicked()
+                        {
+                            copy_all = true;
+                        }
                         ui.checkbox(&mut self.show_debug, "调试信息");
                     });
                 });
+                if copy_all {
+                    self.copy_all_logs(ui.ctx());
+                }
                 ui.add_space(6.0);
                 Frame::new()
                     .fill(p.console)
@@ -3393,6 +3537,12 @@ impl App {
                                     if entry.level == Level::Debug && !self.show_debug {
                                         continue;
                                     }
+                                    let line = format!(
+                                        "[{}] [{}] {}",
+                                        entry.time,
+                                        level_label(entry.level),
+                                        entry.msg
+                                    );
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             RichText::new(&entry.time)
@@ -3406,12 +3556,22 @@ impl App {
                                                 .size(10.5)
                                                 .color(level_color(entry.level, p)),
                                         );
-                                        ui.label(
-                                            RichText::new(&entry.msg)
-                                                .monospace()
-                                                .size(10.5)
-                                                .color(p.text2),
-                                        );
+                                        let _ = ui
+                                            .label(
+                                                RichText::new(&entry.msg)
+                                                    .monospace()
+                                                    .size(10.5)
+                                                    .color(p.text2),
+                                            )
+                                            .on_hover_text("选中文字可用 Ctrl+C；右键可复制整行")
+                                            .context_menu(|ui| {
+                                                if ui.button("复制整行").clicked() {
+                                                    ui.ctx().copy_text(line.clone());
+                                                }
+                                                if ui.button("只复制消息内容").clicked() {
+                                                    ui.ctx().copy_text(entry.msg.clone());
+                                                }
+                                            });
                                     });
                                 }
                             });
@@ -3913,6 +4073,16 @@ fn level_color(l: Level, p: Palette) -> Color32 {
         Level::Error => p.error,
         Level::Debug => p.text3,
     }
+}
+
+/// Free function so clipboard / export formatting is unit-testable without
+/// constructing a whole `App`. One line per entry, in display order.
+fn logs_to_text(logs: &[LogEntry], include_debug: bool) -> String {
+    logs.iter()
+        .filter(|l| include_debug || l.level != Level::Debug)
+        .map(|l| format!("[{}] [{}] {}", l.time, level_label(l.level), l.msg))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -4544,5 +4714,107 @@ mod tests {
         for needle in ["chip_id_open", "chip_id_snapshot", "chip_id_custom"] {
             assert!(!body.contains(needle), "chip-ID state leaked into Settings: {needle}");
         }
+    }
+
+    /// A loaded firmware used to be impossible to remove. Both panes now
+    /// offer a close action that wipes every bit of loaded state, including
+    /// the persisted path (otherwise it would come back on the next launch).
+    #[test]
+    fn firmware_can_be_unloaded_from_both_panes() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split("fn clear_firmware")
+            .nth(1)
+            .unwrap()
+            .split("fn open_serial")
+            .next()
+            .unwrap();
+        for needle in [
+            "self.cfg.firmware.take()",
+            "self.firmware = None",
+            "self.firmware_view = None",
+            "self.hex_source = HexSource::Image",
+        ] {
+            assert!(body.contains(needle), "clear_firmware must reset {needle}");
+        }
+        assert!(source.contains("fn has_firmware"));
+        assert!(source.contains(concat!("✕ ", "移除")));
+        assert!(source.contains(concat!("✕ ", "关闭固件")));
+        assert_eq!(source.matches(concat!("self.clear_", "firmware()")).count(), 2);
+        // Recent entries are removable too, individually or all at once.
+        assert!(source.contains("self.recent.clear()"));
+    }
+
+    /// The most used action must not require scrolling, and there is exactly
+    /// one button: duplicated controls are explicitly unwanted in this UI.
+    #[test]
+    fn flash_button_is_pinned_above_the_scroll_area() {
+        let source = include_str!("app.rs");
+        assert_eq!(source.matches(concat!("开始", "烧录")).count(), 1);
+        let sidebar = source
+            .split("fn sidebar_workbench")
+            .nth(1)
+            .unwrap()
+            .split("fn session_connection")
+            .next()
+            .unwrap();
+        let btn = sidebar.find(concat!("开始", "烧录")).unwrap();
+        let scroll = sidebar.find("egui::ScrollArea::vertical()").unwrap();
+        assert!(btn < scroll, "flash button must sit outside the scroll area");
+        assert!(sidebar.contains("self.start_job(Job::Flash"));
+    }
+
+    /// Copied logs are plain, ordered and respect the DEBUG filter, so what
+    /// lands in the clipboard matches what the console is showing.
+    #[test]
+    fn log_clipboard_text_matches_the_visible_console() {
+        let logs = vec![
+            LogEntry { time: "12:00:00".into(), level: Level::Info, msg: "连接成功".into() },
+            LogEntry { time: "12:00:01".into(), level: Level::Debug, msg: "SWD 10000".into() },
+            LogEntry { time: "12:00:02".into(), level: Level::Error, msg: "烧录失败".into() },
+        ];
+        assert_eq!(
+            logs_to_text(&logs, false),
+            "[12:00:00] [INFO ] 连接成功\n[12:00:02] [ERROR] 烧录失败"
+        );
+        assert!(logs_to_text(&logs, true).contains("[DEBUG] SWD 10000"));
+        assert!(logs_to_text(&[], false).is_empty());
+    }
+
+    /// With `default-features = false`, eframe silently falls back to an
+    /// app-local clipboard unless `clipboard` is enabled. Then Ctrl+C and
+    /// every `ctx.copy_text()` only work *inside* the app, which is exactly
+    /// the "can select but cannot copy" bug. Never drop this feature again.
+    #[test]
+    fn eframe_system_clipboard_feature_stays_enabled() {
+        let manifest = include_str!("../Cargo.toml");
+        let eframe_line = manifest
+            .lines()
+            .find(|l| l.starts_with("eframe = "))
+            .expect("eframe dependency missing");
+        assert!(eframe_line.contains("default-features = false"), "{eframe_line}");
+        assert!(eframe_line.contains("\"clipboard\""), "{eframe_line}");
+    }
+
+    /// Selecting label text alone is not enough on a Windows-subsystem
+    /// window: both log surfaces need explicit clipboard actions.
+    #[test]
+    fn log_panes_have_explicit_copy_actions() {
+        let source = include_str!("app.rs");
+        for needle in [
+            "fn copy_all_logs",
+            "fn logs_to_text",
+            "fn log_text",
+            "ctx.copy_text(text)",
+            "复制整行",
+            "只复制消息内容",
+            "context_menu(|ui|",
+        ] {
+            assert!(source.contains(needle), "missing log copy wiring: {needle}");
+        }
+        assert_eq!(
+            source.matches(concat!("self.copy_all_", "logs(ui.ctx())")).count(),
+            2
+        );
     }
 }
