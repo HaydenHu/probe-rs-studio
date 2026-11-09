@@ -1804,10 +1804,14 @@ impl App {
     /// Recent firmware is a compact breadcrumb strip in the right half of the
     /// firmware info card. One horizontal row takes far less vertical space
     /// than a list, leaving more room for the hex dump below it.
+    /// Recent firmware is a row of flush, compact buttons in the right half
+    /// of the firmware info card. No separators and no inter-button gaps: the
+    /// entries read as one segmented control and take a single row.
     fn draw_recent_firmware_column(
         ui: &mut Ui,
         p: Palette,
         recent: &[PathBuf],
+        current: Option<&PathBuf>,
         load: &mut Option<PathBuf>,
         remove: &mut Option<PathBuf>,
         clear_all: &mut bool,
@@ -1839,10 +1843,9 @@ impl App {
             return;
         }
         ui.horizontal_wrapped(|ui| {
-            for (index, path) in recent.iter().enumerate() {
-                if index > 0 {
-                    ui.label(RichText::new("›").size(10.0).color(p.text3));
-                }
+            // Buttons sit flush against each other, like a segmented control.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for path in recent {
                 let full = path
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
@@ -1854,11 +1857,17 @@ impl App {
                 } else {
                     full
                 };
+                let active = current == Some(path);
+                let button = egui::Button::new(
+                    RichText::new(&short)
+                        .size(9.0)
+                        .color(if active { p.accent } else { p.text2 }),
+                )
+                .fill(if active { p.accent_soft } else { p.card_alt })
+                .stroke(Stroke::new(1.0, p.border))
+                .min_size(Vec2::new(0.0, 18.0));
                 let response = ui
-                    .add(
-                        egui::Button::new(RichText::new(&short).size(9.0).color(p.text2))
-                            .fill(Color32::TRANSPARENT),
-                    )
+                    .add(button)
                     .on_hover_text(format!("{}\n点击载入 · 右键从最近固件移除", path.display()));
                 if response.clicked() {
                     *load = Some(path.clone());
@@ -3414,6 +3423,7 @@ impl App {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let recent = self.recent.clone();
+                let current = self.cfg.firmware.clone();
                 let mut load_recent: Option<PathBuf> = None;
                 let mut remove_recent: Option<PathBuf> = None;
                 let mut clear_recent = false;
@@ -3501,6 +3511,7 @@ impl App {
                         ui,
                         p,
                         &recent,
+                        current.as_ref(),
                         &mut load_recent,
                         &mut remove_recent,
                         &mut clear_recent,
@@ -5103,8 +5114,10 @@ mod tests {
             .next()
             .unwrap();
         assert!(helper.contains("horizontal_wrapped"));
-        assert!(helper.contains("›"));
+        assert!(helper.contains("item_spacing.x = 0.0"));
         assert!(helper.contains("context_menu"));
+        assert!(helper.contains("current == Some(path)"));
+        assert!(!helper.contains("›"), "breadcrumb separators must be gone");
     }
 
     /// The Windows executable icon is linked from a prebuilt resource, so a
