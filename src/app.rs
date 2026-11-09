@@ -1509,13 +1509,13 @@ impl App {
         ui.horizontal(|ui| {
             Self::section_title(ui, p, "固件文件");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let btn = egui::Button::new(RichText::new("✕ 移除").size(10.0).color(p.error))
-                    .fill(p.card_alt)
+                let btn = egui::Button::new(RichText::new("✕").size(11.0).color(p.error))
+                    .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::new(1.0, p.border))
-                    .min_size(Vec2::new(0.0, 22.0));
+                    .min_size(Vec2::new(20.0, 20.0));
                 if ui
                     .add_enabled(self.has_firmware(), btn)
-                    .on_hover_text("移除当前固件并清空右侧 16 进制查看器（保留最近固件记录）")
+                    .on_hover_text("关闭固件：移除当前固件并清空右侧 16 进制查看器（保留最近固件记录）")
                     .clicked()
                 {
                     clear = true;
@@ -3280,12 +3280,6 @@ impl App {
                     .color(p.text),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if Self::ghost_button(ui, p, "✕ 关闭固件", self.has_firmware())
-                    .on_hover_text("移除当前固件并清空查看器（保留最近固件记录）")
-                    .clicked()
-                {
-                    clear = true;
-                }
                 if Self::ghost_button(ui, p, "浏览…", true).clicked() {
                     picked = with_all_files(rfd::FileDialog::new())
                         .add_filter("固件", &["hex", "ihex", "elf", "axf", "out", "bin"])
@@ -3293,9 +3287,6 @@ impl App {
                 }
             });
         });
-        if clear {
-            self.clear_firmware();
-        }
         if let Some(path) = picked {
             self.set_firmware(path);
         }
@@ -3335,6 +3326,7 @@ impl App {
         let rows = bytes.len().saturating_add(self.hex_columns - 1) / self.hex_columns;
         let capped = view.as_ref().is_some_and(|v| v.raw.len() >= HEX_VIEW_LIMIT);
 
+        let has_fw = self.has_firmware();
         Frame::new()
             .fill(p.card)
             .stroke(Stroke::new(1.0, p.border))
@@ -3342,7 +3334,29 @@ impl App {
             .inner_margin(14.0)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(&file_name).size(12.0).strong().color(p.text));
+                // Top-right corner of the firmware card: a bare ✕ with no
+                // text label, so it reads as a standard close affordance.
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&file_name).size(12.0).strong().color(p.text),
+                        )
+                        .truncate(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let btn = egui::Button::new(RichText::new("✕").size(12.0).color(p.error))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::new(1.0, p.border))
+                            .min_size(Vec2::new(22.0, 20.0));
+                        if ui
+                            .add_enabled(has_fw, btn)
+                            .on_hover_text("关闭固件：移除当前固件并清空查看器（保留最近固件记录）")
+                            .clicked()
+                        {
+                            clear = true;
+                        }
+                    });
+                });
                 if !summary.is_empty() {
                     ui.label(RichText::new(&summary).size(10.0).color(p.text2));
                 }
@@ -3388,6 +3402,9 @@ impl App {
                     );
                 });
             });
+        if clear {
+            self.clear_firmware();
+        }
         ui.add_space(10.0);
 
         if bytes.is_empty() {
@@ -3599,11 +3616,11 @@ impl App {
         );
         ui.add_space(10.0);
 
-        // Leave room for the info strip and the send pane even when the
-        // bottom log dock is expanded to its default height. The periodic-send
-        // row and the (optional) quick-input strip add their own height.
+        // Reserve room for the send pane even when the bottom log dock is
+        // expanded. Both panes now keep their controls on the header row,
+        // so the freed rows go to the receive area instead.
         let send_extra = 32.0 + if self.serial_emoji_open { 42.0 } else { 0.0 };
-        let rx_height = (ui.available_height() - 300.0 - send_extra).max(110.0);
+        let rx_height = (ui.available_height() - 195.0 - send_extra).max(110.0);
         let name = self
             .serial_open_name
             .clone()
@@ -3615,50 +3632,7 @@ impl App {
         let tx_total = self.serial_tx_bytes;
         let mut clear_rx = false;
         let mut toggle = None;
-        Frame::new()
-            .fill(p.card)
-            .stroke(Stroke::new(1.0, p.border))
-            .corner_radius(12.0)
-            .inner_margin(12.0)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    for (key, value, color) in [
-                        ("端口", name.clone(), p.text),
-                        ("参数", cfg.clone(), p.accent),
-                        ("RX", format!("{rx_total} 字节"), p.text2),
-                        ("TX", format!("{tx_total} 字节"), p.text2),
-                    ] {
-                        ui.label(RichText::new(key).size(9.0).color(p.text3));
-                        ui.label(RichText::new(value).size(11.0).color(color));
-                        ui.add_space(12.0);
-                    }
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("清空接收").clicked() {
-                        clear_rx = true;
-                    }
-                    if ui
-                        .button(if open { "关闭串口" } else { "打开串口" })
-                        .clicked()
-                    {
-                        toggle = Some(open);
-                    }
-                    if let Some(err) = &self.serial_error {
-                        ui.label(RichText::new(err).size(9.0).color(p.error));
-                    }
-                });
-            });
-        if clear_rx {
-            self.serial_rx.clear();
-        }
-        if toggle == Some(false) {
-            self.close_serial();
-        } else if toggle == Some(true) {
-            self.open_serial();
-        }
-        ui.add_space(10.0);
+        let serial_error = self.serial_error.clone();
 
         let rx_hex = self.serial_rx_hex;
         let auto_scroll = self.serial_auto_scroll;
@@ -3681,23 +3655,60 @@ impl App {
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // The separate info strip is gone: port, parameters, counters
+                // and the open / clear actions all live on this header row.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("接收区").size(12.0).strong().color(p.text));
+                    ui.label(
+                        RichText::new(format!("{name} · {cfg}"))
+                            .size(9.0)
+                            .color(p.accent),
+                    );
+                    ui.label(
+                        RichText::new(format!(
+                            "RX {rx_total} · TX {tx_total} · 缓冲 {} B",
+                            rx.len()
+                        ))
+                        .size(9.0)
+                        .color(p.text3),
+                    );
+                    // Non-UTF-8 bytes show up as U+FFFD in text mode. Point at
+                    // the HEX view instead of leaving the user with "乱码".
+                    if !rx_hex && rx_text.contains('\u{FFFD}') {
+                        ui.label(
+                            RichText::new("含非文本字节 · 建议勾选 HEX 显示")
+                                .size(9.0)
+                                .color(p.warn),
+                        );
+                    }
+                    if let Some(err) = &serial_error {
+                        ui.label(RichText::new(err).size(9.0).color(p.error));
+                    }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             ui.checkbox(&mut self.serial_rx_hex, "HEX 显示");
                             ui.checkbox(&mut self.serial_auto_scroll, "自动滚动");
+                            if ui
+                                .button(if open { "关闭串口" } else { "打开串口" })
+                                .on_hover_text("打开 / 关闭当前串口")
+                                .clicked()
+                            {
+                                toggle = Some(open);
+                            }
+                            if ui
+                                .button("清空接收")
+                                .on_hover_text("清空接收缓冲（累计 RX / TX 计数保留）")
+                                .clicked()
+                            {
+                                clear_rx = true;
+                            }
                             ui.label(
-                                RichText::new(format!("{:.1} pt · Ctrl+滚轮缩放", rx_size))
+                                RichText::new(format!("{rx_size:.1} pt"))
                                     .size(9.0)
                                     .color(p.text3),
-                            );
-                            ui.label(
-                                RichText::new(format!("{} 字节", rx.len()))
-                                    .size(9.0)
-                                    .color(p.text3),
-                            );
+                            )
+                            .on_hover_text("Ctrl + 滚轮缩放接收区文字");
                         },
                     );
                 });
@@ -3774,6 +3785,14 @@ impl App {
                         });
                 }
             });
+        if clear_rx {
+            self.serial_rx.clear();
+        }
+        if toggle == Some(false) {
+            self.close_serial();
+        } else if toggle == Some(true) {
+            self.open_serial();
+        }
         if zoom != 0.0 && ui.rect_contains_pointer(rx_frame.response.rect) {
             self.serial_rx_font_size = clamp_font_size(self.serial_rx_font_size, zoom);
         }
@@ -3790,11 +3809,37 @@ impl App {
             .inner_margin(egui::Margin::symmetric(12, 10))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // Mirror the receive pane: all actions live on one header
+                // row, leaving the card body for the input box only.
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("发送区").size(12.0).strong().color(p.text));
+                    if parse_timer_ms(&self.serial_timer_text).is_none() {
+                        ui.label(
+                            RichText::new(format!(
+                                "周期范围 {}–{} ms",
+                                SERIAL_TIMER_MIN_MS, SERIAL_TIMER_MAX_MS
+                            ))
+                            .size(9.0)
+                            .color(p.error),
+                        );
+                    } else if self.serial_timer_on {
+                        ui.label(
+                            RichText::new(format!("定时发送已发 {} 次", self.serial_timer_sent))
+                                .size(9.0)
+                                .color(p.accent),
+                        );
+                    } else if !open {
+                        ui.label(RichText::new("需先打开串口").size(9.0).color(p.text3));
+                    }
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
+                            ui.label(
+                                RichText::new(format!("{tx_size:.1} pt"))
+                                    .size(9.0)
+                                    .color(p.text3),
+                            )
+                            .on_hover_text("Ctrl + 滚轮缩放发送区文字");
                             let label = if self.serial_emoji_open {
                                 "收起快捷输入"
                             } else {
@@ -3803,11 +3848,24 @@ impl App {
                             if ui.button(label).clicked() {
                                 self.serial_emoji_open = !self.serial_emoji_open;
                             }
-                            ui.label(
-                                RichText::new(format!("{:.1} pt · Ctrl+滚轮缩放", tx_size))
-                                    .size(9.0)
-                                    .color(p.text3),
+                            ui.checkbox(&mut self.serial_tx_hex, "HEX 发送");
+                            ui.checkbox(&mut self.serial_append_nl, "追加 CRLF");
+                            if ui.button("清空输入").clicked() {
+                                clear_tx = true;
+                            }
+                            // The send action is a round button in the
+                            // bottom-right corner (chat-input style), so the
+                            // header only carries auxiliary controls.
+                            // Added last so this group reads left-to-right as
+                            // "定时发送 每 [1000] ms" in a right-to-left layout.
+                            ui.label(RichText::new("ms").size(9.0).color(p.text3));
+                            ui.add_sized(
+                                [56.0, 20.0],
+                                egui::TextEdit::singleline(&mut self.serial_timer_text)
+                                    .desired_width(56.0),
                             );
+                            ui.label(RichText::new("每").size(9.0).color(p.text3));
+                            ui.checkbox(&mut self.serial_timer_on, "定时发送");
                         },
                     );
                 });
@@ -3857,52 +3915,57 @@ impl App {
                             });
                         });
                 }
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if Self::primary_button(ui, p, "发送", open).clicked() {
-                        send = true;
-                    }
-                    if ui.button("清空输入").clicked() {
-                        clear_tx = true;
-                    }
-                    ui.checkbox(&mut self.serial_append_nl, "追加 CRLF");
-                    ui.checkbox(&mut self.serial_tx_hex, "HEX 发送");
+                ui.add_space(10.0);
+                // Chat-input style footer: a hint on the left and a round
+                // accent send button pinned to the bottom-right corner. The
+                // arrow is drawn as vector shapes, so it never depends on an
+                // emoji font falling back to a coloured square.
+                ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("Ctrl + Enter 快捷发送")
                             .size(9.0)
                             .color(p.text3),
                     );
-                });
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.checkbox(&mut self.serial_timer_on, "定时发送");
-                    ui.label(RichText::new("每").size(10.0).color(p.text3));
-                    ui.add_sized(
-                        [64.0, 20.0],
-                        egui::TextEdit::singleline(&mut self.serial_timer_text)
-                            .desired_width(64.0),
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let (rect, resp) =
+                                ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+                            let hovered = resp.hovered();
+                            let bg = if open { p.accent } else { p.card_alt };
+                            ui.painter().circle_filled(rect.center(), 16.0, bg);
+                            if open && hovered {
+                                ui.painter().add(egui::Shape::circle_stroke(
+                                    rect.center(),
+                                    15.0,
+                                    Stroke::new(2.0, Color32::WHITE),
+                                ));
+                            }
+                            let c = rect.center();
+                            let fg = if open { Color32::WHITE } else { p.text3 };
+                            ui.painter().add(egui::Shape::convex_polygon(
+                                vec![
+                                    c + Vec2::new(0.0, -8.0),
+                                    c + Vec2::new(7.0, 1.0),
+                                    c + Vec2::new(-7.0, 1.0),
+                                ],
+                                fg,
+                                egui::epaint::PathStroke::NONE,
+                            ));
+                            ui.painter().rect_filled(
+                                Rect::from_center_size(
+                                    c + Vec2::new(0.0, 6.0),
+                                    Vec2::new(3.0, 8.0),
+                                ),
+                                0.0,
+                                fg,
+                            );
+                            let resp = resp.on_hover_text("发送（Ctrl + Enter）");
+                            if open && resp.clicked() {
+                                send = true;
+                            }
+                        },
                     );
-                    ui.label(RichText::new("ms").size(10.0).color(p.text3));
-                    if parse_timer_ms(&self.serial_timer_text).is_none() {
-                        ui.label(
-                            RichText::new(format!(
-                                "周期范围 {}–{} ms",
-                                SERIAL_TIMER_MIN_MS, SERIAL_TIMER_MAX_MS
-                            ))
-                            .size(9.0)
-                            .color(p.error),
-                        );
-                    } else if !open {
-                        ui.label(
-                            RichText::new("需先打开串口").size(9.0).color(p.text3),
-                        );
-                    } else if self.serial_timer_on {
-                        ui.label(
-                            RichText::new(format!("已发 {} 次", self.serial_timer_sent))
-                                .size(9.0)
-                                .color(p.accent),
-                        );
-                    }
                 });
             });
         if zoom != 0.0 && ui.rect_contains_pointer(tx_frame.response.rect) {
@@ -4738,11 +4801,100 @@ mod tests {
             assert!(body.contains(needle), "clear_firmware must reset {needle}");
         }
         assert!(source.contains("fn has_firmware"));
-        assert!(source.contains(concat!("✕ ", "移除")));
-        assert!(source.contains(concat!("✕ ", "关闭固件")));
+        // Only a bare ✕ remains: the old text labels must not come back.
+        assert!(!source.contains(concat!("✕ ", "移除")));
+        assert!(!source.contains(concat!("✕ ", "关闭固件")));
         assert_eq!(source.matches(concat!("self.clear_", "firmware()")).count(), 2);
         // Recent entries are removable too, individually or all at once.
         assert!(source.contains("self.recent.clear()"));
+    }
+
+    /// The centre pane keeps only a bare ✕ and pins it to the top-right
+    /// corner of the firmware info card, instead of showing a text button
+    /// next to the page title.
+    #[test]
+    fn firmware_close_icon_sits_in_card_top_right() {
+        let source = include_str!("app.rs");
+        let icon = '\u{2715}';
+        let viewer = source
+            .split("fn draw_hex_viewer")
+            .nth(1)
+            .unwrap()
+            .split("fn draw_serial_center")
+            .next()
+            .unwrap();
+        let card_start = viewer.find(".fill(p.card)").unwrap();
+        let header = &viewer[..card_start];
+        let card = &viewer[card_start..];
+        assert!(!header.contains(icon), "page header must not keep a close button");
+        assert!(card.contains(icon), "close icon must be inside the info card");
+        let first_row = card.split("ui.horizontal_wrapped").next().unwrap();
+        assert!(
+            first_row.contains("Layout::right_to_left"),
+            "close icon must be right-aligned on the card's first row"
+        );
+        assert!(first_row.contains("add_enabled"));
+    }
+
+    /// The standalone serial info-strip card is gone: port/counters and the
+    /// open / clear actions all moved onto the receive-pane header row.
+    #[test]
+    fn serial_receive_header_owns_the_info_strip_actions() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split("fn draw_serial_center")
+            .nth(1)
+            .unwrap()
+            .split("\n    fn ")
+            .next()
+            .unwrap();
+        assert!(!body.contains("(\"端口\", name.clone()"), "info strip card still rendered");
+        assert!(body.contains("- 195.0 - send_extra"), "receive pane must reclaim the freed rows");
+        let rx_start = body.find(".fill(p.console)").unwrap();
+        let header = body[rx_start..].split("ui.separator()").next().unwrap();
+        for needle in [
+            "清空接收",
+            "关闭串口",
+            "打开串口",
+            "RX {rx_total}",
+            "serial_rx_hex",
+            "Layout::right_to_left",
+        ] {
+            assert!(header.contains(needle), "receive header missing {needle}");
+        }
+
+        // The send pane uses the same layout: its old two action rows are
+        // gone and every control is on the header row.
+        assert!(!body.contains("horizontal_wrapped"), "old action rows still rendered");
+        assert!(!body.contains("ui.add_space(4.0)"), "stray gap from the old send rows");
+        let tx_start = body.find("\"发送区\"").unwrap();
+        let tx_header = body[tx_start..].split("TextEdit::multiline").next().unwrap();
+        for needle in [
+            "清空输入",
+            "追加 CRLF",
+            "HEX 发送",
+            "定时发送",
+            "快捷输入",
+            "Layout::right_to_left",
+        ] {
+            assert!(tx_header.contains(needle), "send header missing {needle}");
+        }
+        assert!(
+            !tx_header.contains("primary_button"),
+            "send must not sit on the header row"
+        );
+        // Chat-input style: a round vector send button in the bottom-right.
+        for needle in [
+            "circle_filled",
+            "convex_polygon",
+            "发送（Ctrl + Enter）",
+        ] {
+            assert!(body.contains(needle), "round send button missing {needle}");
+        }
+        assert!(
+            body.contains("建议勾选 HEX 显示"),
+            "garbled text must point at the HEX view"
+        );
     }
 
     /// The most used action must not require scrolling, and there is exactly
