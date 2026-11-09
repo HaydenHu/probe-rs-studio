@@ -27,7 +27,7 @@ GUI 侧另有兜底：`Connect` / `ReadBack` / `Flash` / `VerifyFirmware` / `Era
 - 探针枚举、按设备身份选择、连接测试；USB 插入/拔出自动检测（1.5 秒轮询 + 去抖），烧录期间自动暂停轮询
 - **网络探针（elaphureLink 无线下载器）**：fork 的 probe-rs 新增 TCP CMSIS-DAP 后端，按 OpenOCD `cmsis-dap backend elaphurelink` 的握手与 `0x88` vendor 帧收发；GUI「连接配置」默认已填 `dap.local`，下拉框里直接可选、改地址实时更新（详见「网络探针：elaphureLink」）
 - **烧录按钮常驻**：「开始烧录」固定在「当前会话」侧栏顶部、滚动区之外，滚到任何设置位置都能一键触达；全界面只有这一个烧录入口，避免重复控件
-- **固件可移除**：左栏「固件文件」标题行右侧、右侧固件信息卡片右上角各有一个**纯「✕」**关闭按钮（不带文字，悬停显示说明）；点击会清除当前固件、解码信息、16 进制缓冲，并清掉配置里保存的路径（下次启动不会自动载回）；「最近固件」记录还能逐条 ✕ 删除或一键清空
+- **固件可移除**：左栏「固件文件」标题行右侧、右侧固件信息卡片右上角各有一个**纯「✕」**关闭按钮（不带文字，悬停显示说明）；点击会清除当前固件、解码信息、16 进制缓冲，并清掉配置里保存的路径（下次启动不会自动载回）；「最近固件」以**横向面包屑**放在右侧固件信息卡片的**右栏**（点选载入、右键移除、一键清空），只占一行高度
 - **日志可复制**：日志台「复制全部」把当前可见日志按时间顺序写进系统剪贴板，单条日志右键可「复制整行 / 只复制消息内容」，运行日志页也有「复制全部日志」；选中文字按 Ctrl+C 同样能粘贴到其它程序（详见「日志复制与剪贴板」）
 - **串口识别 + 串口终端**：纯 Rust Win32 FFI 枚举当前在线 COM 口，自动标注 DAPLink / CMSIS-DAP 自带的虚拟串口（VID/PID、接口号、占用状态），2 秒轮询自动刷新；左侧设置波特率等线路参数并独占打开，右侧会话区实时收发，支持文本 / HEX、CRLF、RX/TX 计数
 - **定时发送**：设定周期（100 ms – 1 小时）后自动重发发送区内容，显示累计次数；关闭串口或会话中断会立即停发，启用状态不写进配置，重启不会自己发
@@ -82,6 +82,28 @@ probe-rs = { path = "../probe-rs/probe-rs", default-features = false, features =
 ```
 
 `.cargo/config.example.toml` 里还提供了共享 `target-dir` 与国内 crates.io 镜像的可选配置。
+
+## Windows 可执行文件图标
+
+`assets/icons/app-icon.rgba`（64×64 RGBA）是运行时窗口 / 任务栏图标；同一图案的
+`assets/icons/app-icon.ico` 是 16 / 32 / 48 / 64 四种尺寸的 32bpp + alpha ICO，用作
+**exe 文件本身的图标**（资源管理器、快捷方式、Alt+Tab 都读它）。
+
+链路：`tools/gen_icons.py` 同时生成 `.rgba` 与 `.ico` → `assets/app-icon.rc` 由 Windows SDK
+`rc.exe` 编译成 `assets/app-icon.res` → `build.rs` 用 `cargo:rustc-link-arg` 把预编译的
+`.res` 链接进 exe。`.res` 已提交，所以正常构建**不需要** SDK 工具，也不需要 `winres`
+之类的 build-dependency，`--offline` 同样可用；非 Windows 目标自动跳过。
+
+改图标时重新生成：
+
+```bash
+python tools/gen_icons.py
+rc /nologo /fo assets\app-icon.res assets\app-icon.rc
+cargo build --release --bin probe-rs-studio
+```
+
+`rc.exe` 在 Windows SDK 的 `bin/<版本>/x64/` 下；Git Bash 里要设 `MSYS_NO_PATHCONV=1`，
+否则 `/fo` 会被路径转换破坏。
 
 ## 扩展芯片支持：一个入口，pack / FLM 都行
 
@@ -199,12 +221,13 @@ probe-rs-studio.exe --load MYCHIP.FLM --chip MYCHIP_A --load-address 0x20000400 
 | 连接配置 | 调试探针（按身份选择）、协议 / 速度、目标芯片、最近型号快捷项、复位下连接、连接测试、芯片详情 |
 | 固件文件 | 标题行右侧纯「✕」关闭按钮、浏览 / 拖入固件、格式、BIN 基址、文件名 / 大小 / SHA256 |
 | 烧录选项与操作 | 6 个选项开关、独立校验、读回备份、复位运行、整片擦除（二次确认）、读回地址与长度、备份路径 |
-| 最近固件 / 快捷操作 | 最近用过的固件（每条带 ✕、标题栏「清空」）、刷新探针、查看日志 |
+| 快捷操作 | 刷新探针、查看日志（最近固件已移到右侧固件信息卡片的右栏） |
 
 右侧会话区是**固件 16 进制查看器**：载入 `.hex` / `.elf` / `.bin` 后立即显示
 偏移、十六进制字节和 ASCII 栏，采用虚拟滚动，只渲染可见行（大文件也不会卡）；
-固件信息卡片的**右上角**是纯「✕」关闭按钮（不带文字标签，悬停提示「关闭固件」），
-一键卸载；页面标题栏只保留「浏览…」。
+固件信息卡片分**左右两栏**：左栏是文件名 / 摘要 / SHA256 与查看设置，右上角是纯「✕」
+关闭按钮（不带文字标签，悬停提示「关闭固件」），一键卸载；**右栏是「最近固件」横向面包屑**（`›` 分隔、点选载入、右键移除、标题栏「清空」），
+一行就能显示全部记录，正好填掉原本大片空白，也不会把卡片撑高。页面标题栏只保留「浏览…」。
 
 - 「数据源」可切换 **固件镜像**（Intel HEX / BIN 解码后的连续镜像，偏移按实际烧录地址，
   如 `0x08000000`）与 **文件原始字节**；ELF 或无法解码的文件自动回退到原始字节
@@ -631,7 +654,7 @@ cargo test --release --bin probe-rs-studio
 
 ```
 src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --connect / --network / --ob-open / --id-open 分派
-src/app.rs        会话侧栏（顶部固定烧录按钮 / 固件卸载 / 最近固件删除）、16 进制查看器（卡片右上角纯「✕」）、串口终端（接收区 / 发送区标题行集成控制、定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、日志剪贴板复制与右键菜单、选项字节与芯片 ID 窗口、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
+src/app.rs        会话侧栏（顶部固定烧录按钮 / 固件卸载 / 快捷操作）、16 进制查看器（固件信息卡片左右分栏：左栏详情 + 右栏最近固件面包屑、右上角纯「✕」）、串口终端（接收区 / 发送区标题行集成控制、定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、日志剪贴板复制与右键菜单、选项字节与芯片 ID 窗口、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
 src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、内核一致性核对、网络探针选择器解析与直连、探针重新枚举与死锁识别、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
 src/chip_id.rs    芯片 ID 寄存器预设与 CPUID / DPIDR / IDCODE / UID / FlashSize 解码、内核型号与芯片描述一致性判定、报告格式化（纯逻辑，可单测）
 src/option_bytes.rs  选项字节 16 字节镜像、字段编解码、反码维护、变更 diff 与安全校验（纯逻辑，可单测）
@@ -640,10 +663,12 @@ src/firmware.rs   HEX / ELF / BIN 解析与 SHA256
 src/serial.rs     纯 Rust Win32 FFI 串口枚举、线路参数、独占打开、非阻塞收发与队列诊断
 src/theme.rs      深浅两套配色、CJK 与彩色 emoji 系统字体 fallback（emoji 排在 CJK 之前）
 src/icons.rs      SVG 子集解析 + epaint 矢量绘制
-assets/icons/     6 个 SVG 图标 + Windows 任务栏图标 RGBA
+assets/icons/     6 个 SVG 图标 + 窗口图标 RGBA + 多尺寸 exe 图标 ICO
+assets/app-icon.rc / .res  Windows exe 图标资源脚本与预编译资源（build.rs 链接）
+build.rs          把 app-icon.res 链接进 Windows exe（非 Windows 目标跳过）
 assets/PY32F0xx_OPT.yaml  由 PY32F0xx_OPT.FLM 生成的内置选项字节算法描述（编译进二进制）
 targets/          CMSIS-Pack 转换出的扩展芯片描述 YAML
 tests/fixtures/   精简 pack 与 .pack.zip 测试样本
-tools/gen_icons.py  由统一几何定义生成 SVG 与 OS 图标
+tools/gen_icons.py  由统一几何定义生成 SVG、窗口图标 RGBA 与多尺寸 ICO
 tools/flm_to_yaml.py 生成 bundled HC32F4XX.yaml 的离线脚本（历史用途）
 ```

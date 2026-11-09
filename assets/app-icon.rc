@@ -1,0 +1,4 @@
+// Windows executable icon for ProbeRS Studio.
+// Compiled once with the Windows SDK rc.exe into app-icon.res; build.rs links
+// that prebuilt resource so a release build needs no SDK tools or new crates.
+1 ICON "assets/icons/app-icon.ico"

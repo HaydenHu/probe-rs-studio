@@ -1400,7 +1400,7 @@ impl App {
                 ui.add_space(14.0);
                 self.session_actions(ui, p);
                 ui.add_space(14.0);
-                self.session_recents(ui, p);
+                self.session_quick_actions(ui, p);
             });
     }
 
@@ -1779,73 +1779,7 @@ impl App {
         });
     }
 
-    fn session_recents(&mut self, ui: &mut Ui, p: Palette) {
-        let mut load: Option<PathBuf> = None;
-        let mut remove: Option<PathBuf> = None;
-        let mut clear_all = false;
-        ui.horizontal(|ui| {
-            Self::section_title(ui, p, "最近固件");
-            if !self.recent.is_empty() {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let btn = egui::Button::new(RichText::new("清空").size(9.0).color(p.text3))
-                        .fill(Color32::TRANSPARENT)
-                        .min_size(Vec2::new(0.0, 18.0));
-                    if ui
-                        .add(btn)
-                        .on_hover_text("清空最近固件记录（不影响当前已载入的固件）")
-                        .clicked()
-                    {
-                        clear_all = true;
-                    }
-                });
-            }
-        });
-        ui.add_space(6.0);
-        if self.recent.is_empty() {
-            ui.label(RichText::new("暂无记录").size(10.0).color(p.text3));
-        }
-        let recent = self.recent.clone();
-        for path in recent {
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new(name).size(10.0).color(p.text2))
-                            .fill(Color32::TRANSPARENT),
-                    )
-                    .on_hover_text(path.display().to_string())
-                    .clicked()
-                {
-                    load = Some(path.clone());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let btn = egui::Button::new(RichText::new("✕").size(9.0).color(p.text3))
-                        .fill(Color32::TRANSPARENT)
-                        .min_size(Vec2::new(18.0, 18.0));
-                    if ui
-                        .add(btn)
-                        .on_hover_text(format!("从最近固件记录中移除：{}", path.display()))
-                        .clicked()
-                    {
-                        remove = Some(path.clone());
-                    }
-                });
-            });
-        }
-        if clear_all {
-            self.recent.clear();
-            self.push_log(Level::Info, "已清空最近固件记录");
-        } else if let Some(path) = remove {
-            self.recent.retain(|p| p != &path);
-            self.push_log(Level::Info, format!("已从最近固件移除: {}", path.display()));
-        }
-        if let Some(path) = load {
-            self.set_firmware(path);
-        }
-        ui.add_space(12.0);
+    fn session_quick_actions(&mut self, ui: &mut Ui, p: Palette) {
         Self::section_title(ui, p, "快捷操作");
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -1862,6 +1796,80 @@ impl App {
                 .size(9.0)
                 .color(p.text3),
         );
+    }
+
+    /// Recent firmware lives in the right half of the firmware info card,
+    /// filling the space that used to be empty. Actions are collected into
+    /// the caller's flags so this helper does not borrow `self`.
+    /// Recent firmware is a compact breadcrumb strip in the right half of the
+    /// firmware info card. One horizontal row takes far less vertical space
+    /// than a list, leaving more room for the hex dump below it.
+    fn draw_recent_firmware_column(
+        ui: &mut Ui,
+        p: Palette,
+        recent: &[PathBuf],
+        load: &mut Option<PathBuf>,
+        remove: &mut Option<PathBuf>,
+        clear_all: &mut bool,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("最近固件").size(10.0).strong().color(p.text));
+            if !recent.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("清空").size(9.0).color(p.text3))
+                                .fill(Color32::TRANSPARENT),
+                        )
+                        .on_hover_text("清空最近固件记录（不影响当前已载入的固件）")
+                        .clicked()
+                    {
+                        *clear_all = true;
+                    }
+                });
+            }
+        });
+        ui.add_space(4.0);
+        if recent.is_empty() {
+            ui.label(
+                RichText::new("暂无记录 · 载入固件后自动记录")
+                    .size(9.0)
+                    .color(p.text3),
+            );
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (index, path) in recent.iter().enumerate() {
+                if index > 0 {
+                    ui.label(RichText::new("›").size(10.0).color(p.text3));
+                }
+                let full = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let short: String = if full.chars().count() > 16 {
+                    let mut text: String = full.chars().take(15).collect();
+                    text.push('…');
+                    text
+                } else {
+                    full
+                };
+                let response = ui
+                    .add(
+                        egui::Button::new(RichText::new(&short).size(9.0).color(p.text2))
+                            .fill(Color32::TRANSPARENT),
+                    )
+                    .on_hover_text(format!("{}\n点击载入 · 右键从最近固件移除", path.display()));
+                if response.clicked() {
+                    *load = Some(path.clone());
+                }
+                response.context_menu(|ui| {
+                    if ui.button("从最近固件移除").clicked() {
+                        *remove = Some(path.clone());
+                    }
+                });
+            }
+        });
     }
 
     fn section_title(ui: &mut Ui, p: Palette, text: &str) {
@@ -3405,8 +3413,12 @@ impl App {
             .inner_margin(14.0)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                // Top-right corner of the firmware card: a bare ✕ with no
-                // text label, so it reads as a standard close affordance.
+                let recent = self.recent.clone();
+                let mut load_recent: Option<PathBuf> = None;
+                let mut remove_recent: Option<PathBuf> = None;
+                let mut clear_recent = false;
+                // Card-wide header: the bare close icon belongs in the
+                // top-right corner of the whole card, not of the left column.
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::Label::new(
@@ -3428,50 +3440,82 @@ impl App {
                         }
                     });
                 });
-                if !summary.is_empty() {
-                    ui.label(RichText::new(&summary).size(10.0).color(p.text2));
-                }
-                if !sha.is_empty() {
-                    ui.label(
-                        RichText::new(format!("SHA256  {sha}"))
-                            .monospace()
-                            .size(9.5)
-                            .color(p.text3),
-                    );
-                }
-                ui.add_space(10.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("数据源").size(10.0).color(p.text3));
-                    egui::ComboBox::from_id_salt("hex_source_combo")
-                        .selected_text(self.hex_source.label())
-                        .width(132.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.hex_source, HexSource::Image, "固件镜像");
-                            ui.selectable_value(
-                                &mut self.hex_source,
-                                HexSource::File,
-                                "文件原始字节",
-                            );
-                        });
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("每行字节").size(10.0).color(p.text3));
-                    egui::ComboBox::from_id_salt("hex_columns_combo")
-                        .selected_text(self.hex_columns.to_string())
-                        .width(58.0)
-                        .show_ui(ui, |ui| {
-                            for n in [8usize, 16, 32] {
-                                ui.selectable_value(&mut self.hex_columns, n, n.to_string());
-                            }
-                        });
-                    ui.add_space(8.0);
-                    ui.checkbox(&mut self.hex_ascii, "ASCII 栏");
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!("{label} · 基址 0x{base:08X} · {rows} 行"))
-                            .size(10.0)
-                            .color(p.accent),
+                ui.columns(2, |columns| {
+                    // Left column: loaded firmware details and view settings.
+                    let ui = &mut columns[0];
+                    if !summary.is_empty() {
+                        ui.add(
+                            egui::Label::new(RichText::new(&summary).size(10.0).color(p.text2))
+                                .truncate(),
+                        );
+                    }
+                    if !sha.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("SHA256  {sha}"))
+                                    .monospace()
+                                    .size(9.5)
+                                    .color(p.text3),
+                            )
+                            .truncate(),
+                        );
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("数据源").size(10.0).color(p.text3));
+                        egui::ComboBox::from_id_salt("hex_source_combo")
+                            .selected_text(self.hex_source.label())
+                            .width(132.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.hex_source, HexSource::Image, "固件镜像");
+                                ui.selectable_value(
+                                    &mut self.hex_source,
+                                    HexSource::File,
+                                    "文件原始字节",
+                                );
+                            });
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("每行字节").size(10.0).color(p.text3));
+                        egui::ComboBox::from_id_salt("hex_columns_combo")
+                            .selected_text(self.hex_columns.to_string())
+                            .width(58.0)
+                            .show_ui(ui, |ui| {
+                                for n in [8usize, 16, 32] {
+                                    ui.selectable_value(&mut self.hex_columns, n, n.to_string());
+                                }
+                            });
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut self.hex_ascii, "ASCII 栏");
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!("{label} · 基址 0x{base:08X} · {rows} 行"))
+                                .size(10.0)
+                                .color(p.accent),
+                        );
+                    });
+
+                    // Right column: recent firmware fills the half of the card
+                    // that used to be empty.
+                    let ui = &mut columns[1];
+                    Self::draw_recent_firmware_column(
+                        ui,
+                        p,
+                        &recent,
+                        &mut load_recent,
+                        &mut remove_recent,
+                        &mut clear_recent,
                     );
                 });
+                if clear_recent {
+                    self.recent.clear();
+                    self.push_log(Level::Info, "已清空最近固件记录");
+                } else if let Some(path) = remove_recent {
+                    self.recent.retain(|p| p != &path);
+                    self.push_log(Level::Info, format!("已从最近固件移除: {}", path.display()));
+                }
+                if let Some(path) = load_recent {
+                    self.set_firmware(path);
+                }
             });
         if clear {
             self.clear_firmware();
@@ -5040,4 +5084,41 @@ mod tests {
             2
         );
     }
+
+    /// Recent firmware moved from the scrolling sidebar into the right half
+    /// of the firmware info card, so that card no longer wastes space.
+    #[test]
+    fn recent_firmware_lives_in_the_info_card() {
+        let source = include_str!("app.rs");
+        assert!(source.contains("ui.columns(2, |columns|"));
+        assert!(source.contains("Self::draw_recent_firmware_column"));
+        assert!(source.contains("self.session_quick_actions(ui, p)"));
+        assert!(!source.contains(concat!("self.session_", "recents(ui, p)")));
+        assert!(source.contains("self.recent.clear()"));
+        let helper = source
+            .split("fn draw_recent_firmware_column")
+            .nth(1)
+            .unwrap()
+            .split("fn section_title")
+            .next()
+            .unwrap();
+        assert!(helper.contains("horizontal_wrapped"));
+        assert!(helper.contains("›"));
+        assert!(helper.contains("context_menu"));
+    }
+
+    /// The Windows executable icon is linked from a prebuilt resource, so a
+    /// release build needs neither SDK tools nor an extra build dependency.
+    #[test]
+    fn executable_icon_resource_is_linked() {
+        let build = include_str!("../build.rs");
+        assert!(build.contains("rustc-link-arg"));
+        assert!(build.contains("app-icon.res"));
+        let res = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("app-icon.res");
+        assert!(res.exists(), "missing icon resource: {}", res.display());
+        assert!(include_str!("../tools/gen_icons.py").contains("def make_ico("));
+    }
+
 }

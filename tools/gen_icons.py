@@ -7,8 +7,12 @@ Pure standard library. One geometry definition per icon is emitted twice:
 * ``assets/icons/app-icon.rgba`` -- a 64x64 raw RGBA raster of the brand mark
   on the accent-blue plate. Windows taskbar/title-bar icons must be bitmaps;
   this is the only raster in the project.
+* ``assets/icons/app-icon.ico`` -- the same raster wrapped in a multi-size
+  (16/32/48/64) 32bpp ICO, used by the Windows executable resource
+  (``assets/app-icon.rc`` -> ``assets/app-icon.res`` -> ``build.rs``).
 
 Run:  python tools/gen_icons.py
+      rc /nologo /fo assets\app-icon.res assets\app-icon.rc
 """
 
 import math
@@ -245,6 +249,42 @@ def make_app_icon_rgba(logo_prims):
     return bytes(px)
 
 
+def make_ico(rgba, sizes=(16, 32, 48, 64)):
+    """Wrap the 64x64 RGBA raster in a multi-size 32bpp ICO container.
+
+    Pure standard library: each entry is a BITMAPINFOHEADER plus a bottom-up
+    BGRA bitmap and an all-zero AND mask (alpha carries transparency).
+    """
+    src = 64
+    px = [tuple(rgba[(y * src + x) * 4:(y * src + x) * 4 + 4])
+          for y in range(src) for x in range(src)]
+
+    def image(size):
+        xor = bytearray()
+        for y in range(size - 1, -1, -1):
+            for x in range(size):
+                r, g, b, a = px[(y * src // size) * src + (x * src // size)]
+                xor += bytes((b, g, r, a))
+        row_bytes = ((size + 31) // 32) * 4
+        mask = bytes(row_bytes * size)
+        header = struct.pack(
+            "<IiiHHIIiiII", 40, size, size * 2, 1, 32, 0,
+            len(xor) + len(mask), 0, 0, 0, 0,
+        )
+        return header + bytes(xor) + mask
+
+    images = [(size, image(size)) for size in sizes]
+    offset = 6 + 16 * len(images)
+    directory, data = bytearray(), bytearray()
+    for size, blob in images:
+        directory += struct.pack(
+            "<BBBBHHII", size, size, 0, 0, 1, 32, len(blob), offset
+        )
+        data += blob
+        offset += len(blob)
+    return struct.pack("<HHH", 0, 1, len(images)) + bytes(directory) + bytes(data)
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     icons = geometry()
@@ -253,10 +293,15 @@ def main():
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(to_svg(prims))
         print(f"  {name + '.svg':<18} {os.path.getsize(path):>6} B  {len(prims)} primitives")
+    rgba = make_app_icon_rgba(icons["logo"])
     path = os.path.join(OUT, "app-icon.rgba")
     with open(path, "wb") as f:
-        f.write(make_app_icon_rgba(icons["logo"]))
+        f.write(rgba)
     print(f"  {'app-icon.rgba':<18} {os.path.getsize(path):>6} B  64x64 RGBA (OS window icon)")
+    path = os.path.join(OUT, "app-icon.ico")
+    with open(path, "wb") as f:
+        f.write(make_ico(rgba))
+    print(f"  {'app-icon.ico':<18} {os.path.getsize(path):>6} B  multi-size (exe icon)")
     print("done ->", os.path.normpath(OUT))
 
 
