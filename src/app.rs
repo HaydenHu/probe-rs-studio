@@ -847,6 +847,14 @@ impl App {
     /// Returns whether that probe is still attached.
     fn apply_probes(&mut self, items: Vec<ProbeItem>) -> bool {
         let chosen = self.cfg.probe_id.clone();
+        let mut items = items;
+        // Network probes cannot be found by USB polling, so keep the configured
+        // one in the dropdown on every refresh.
+        if let Some(entry) = backend::network_probe_entry(&self.cfg.network_probe) {
+            if !items.iter().any(|x| x.id == entry.id) {
+                items.push(entry);
+            }
+        }
         self.probes = items;
         if self.probes.is_empty() {
             self.cfg.probe_index = 0;
@@ -1426,6 +1434,66 @@ impl App {
                     }
                 }
             });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("网络探针（ElaphureLink / CMSIS-DAP TCP）")
+                .size(10.0)
+                .color(p.text3),
+        );
+        let mut apply_network = false;
+        let mut clear_network = false;
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 82.0).max(60.0);
+            ui.add_sized(
+                [w, 24.0],
+                egui::TextEdit::singleline(&mut self.cfg.network_probe)
+                    .hint_text("dap.local / 192.168.1.50:3240"),
+            );
+            if ui.button("应用").clicked() {
+                apply_network = true;
+            }
+            if ui.button("清除").clicked() {
+                clear_network = true;
+            }
+        });
+        ui.label(
+            RichText::new("填地址点「应用」即可在上方下拉框选中；清除则只用 USB 探针")
+                .size(9.0)
+                .color(p.text3),
+        );
+        if apply_network || clear_network {
+            self.cfg.network_probe = self.cfg.network_probe.trim().to_owned();
+            if clear_network {
+                self.cfg.network_probe.clear();
+            }
+            if let Some(selector) = backend::parse_network_probe(&self.cfg.network_probe) {
+                self.cfg.probe_id = Some(backend::network_probe_identity(&selector));
+                self.connection = None;
+                self.push_log(
+                    Level::Info,
+                    format!("已启用网络探针: {}", self.cfg.network_probe),
+                );
+                if let Some(entry) = backend::network_probe_entry(&self.cfg.network_probe) {
+                    if !self.probes.iter().any(|x| x.id == entry.id) {
+                        self.probes.push(entry);
+                    }
+                }
+            } else {
+                self.cfg.probe_id = None;
+                self.connection = None;
+                self.probes
+                    .retain(|x| !x.id.starts_with("0000:0001:") && !x.id.starts_with("0000:0002:"));
+                self.push_log(
+                    Level::Info,
+                    if clear_network {
+                        "已清除网络探针，改用 USB 探针"
+                    } else {
+                        "网络探针地址为空，未启用"
+                    },
+                );
+            }
+            self.start_job(Job::RefreshProbes, "刷新探针");
+        }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("协议").size(10.0).color(p.text3));

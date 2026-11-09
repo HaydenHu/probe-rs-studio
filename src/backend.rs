@@ -21,7 +21,7 @@ use probe_rs::{
         self, BinLoader, BinOptions, DownloadOptions, ElfLoader, ElfOptions, FlashProgress,
         HexLoader, ProgressEvent,
     },
-    probe::{list::Lister, DebugProbeInfo, Probe, WireProtocol},
+    probe::{list::Lister, DebugProbeInfo, DebugProbeSelector, Probe, WireProtocol},
     MemoryInterface, Permissions, Session,
 };
 use sha2::{Digest, Sha256};
@@ -54,6 +54,11 @@ pub struct FlashConfig {
     /// hot-unplug/replug cannot make us silently attach to a different device.
     #[serde(default)]
     pub probe_id: Option<String>,
+    /// Address of a network CMSIS-DAP probe, e.g. `dap.local` for an
+    /// elaphureLink wireless debugger. Empty means USB probes only.
+    /// `probe_id` decides whether it is actually the selected probe.
+    #[serde(default)]
+    pub network_probe: String,
     pub chip: String,
     pub protocol: Protocol,
     pub speed_khz: u32,
@@ -82,6 +87,7 @@ impl Default for FlashConfig {
         Self {
             probe_index: 0,
             probe_id: None,
+            network_probe: String::new(),
             chip: "PY32F003x8".to_owned(),
             protocol: Protocol::Swd,
             speed_khz: 1000,
@@ -474,6 +480,67 @@ fn probe_item(p: &DebugProbeInfo) -> ProbeItem {
             }
         ),
     }
+}
+
+/// Placeholder USB ids probe-rs uses for network CMSIS-DAP backends.
+const NETWORK_TCP_PID: u16 = 0x0001;
+const NETWORK_ELAPHURELINK_PID: u16 = 0x0002;
+
+/// Parse a network probe entry into a probe-rs selector.
+///
+/// A bare address (`dap.local`, `192.168.1.50:3240`) means elaphureLink;
+/// `elaphurelink:<addr>` and `tcp:<addr>` select the backend explicitly.
+/// probe-rs carries the address in the selector's serial number, which is why
+/// the vendor/product ids are placeholders rather than real USB ids.
+pub fn parse_network_probe(text: &str) -> Option<DebugProbeSelector> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (product_id, address) = match text.split_once(':') {
+        Some(("elaphurelink", addr)) if !addr.is_empty() => (NETWORK_ELAPHURELINK_PID, addr),
+        Some(("tcp", addr)) if !addr.is_empty() => (NETWORK_TCP_PID, addr),
+        // An explicit backend with no address is a typo, not a host name.
+        Some(("elaphurelink" | "tcp", _)) => return None,
+        // A bare IPv4 address with a port also splits on ':', so anything
+        // that is not an explicit prefix is used verbatim.
+        _ => (NETWORK_ELAPHURELINK_PID, text),
+    };
+    Some(DebugProbeSelector {
+        vendor_id: 0x0000,
+        product_id,
+        serial_number: Some(address.to_string()),
+        interface: None,
+        usb_location: None,
+    })
+}
+
+/// Stable list identity of a network probe, in the same format as
+/// [`probe_identity`] produces for a physical probe.
+pub fn network_probe_identity(selector: &DebugProbeSelector) -> String {
+    format!(
+        "{:04x}:{:04x}:{}::usb",
+        selector.vendor_id,
+        selector.product_id,
+        selector.serial_number.as_deref().unwrap_or(""),
+    )
+}
+
+/// A dropdown entry for the configured network probe, so it can be selected
+/// alongside USB probes. Network probes cannot be enumerated by USB polling.
+pub fn network_probe_entry(text: &str) -> Option<ProbeItem> {
+    let selector = parse_network_probe(text)?;
+    let address = selector.serial_number.clone()?;
+    let name = if selector.product_id == NETWORK_TCP_PID {
+        "CMSIS-DAP TCP"
+    } else {
+        "elaphureLink"
+    };
+    Some(ProbeItem {
+        id: network_probe_identity(&selector),
+        label: format!("{name}  [0000:{:04x}]", selector.product_id),
+        detail: format!("{address} · 网络 CMSIS-DAP 探针（不参与 USB 热插拔检测）"),
+    })
 }
 
 /// Enumerate probes without opening them. Safe to call repeatedly from a
@@ -1122,6 +1189,33 @@ fn probe_open_hint(err: &str) -> &'static str {
 /// and resolves the probe by its stable identity rather than by index.
 fn open_probe(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<Probe> {
     const ATTEMPTS: usize = 3;
+
+    // A network probe has no USB enumeration, so it is opened directly from
+    // the configured address when its identity is the selected one. A failed
+    // connection is a configuration/availability problem, not a transient USB
+    // error, so it is reported immediately instead of being retried.
+    if let Some(selector) = parse_network_probe(&cfg.network_probe) {
+        let identity = network_probe_identity(&selector);
+        if cfg.probe_id.as_deref() == Some(identity.as_str()) {
+            log(
+                tx,
+                Level::Info,
+                format!(
+                    "打开网络探针: {} [0000:{:04x}]",
+                    cfg.network_probe, selector.product_id
+                ),
+            );
+            return Lister::new().open(selector).map_err(|err| {
+                let text = format!("{:#}", anyhow::Error::from(err));
+                anyhow!(
+                    "无法连接网络探针 {}。请确认设备已上电、地址可解析、TCP 端口可达\
+                     （elaphureLink 默认 3240），且未被 OpenOCD 等程序占用。\n原始错误：{text}",
+                    cfg.network_probe
+                )
+            });
+        }
+    }
+
     let lister = Lister::new();
     for attempt in 1..=ATTEMPTS {
         let probes = lister.list_all();
@@ -2214,5 +2308,64 @@ mod tests {
         let chip_id = include_str!("chip_id.rs");
         assert!(chip_id.contains("\"ROM Table\""));
         assert!(chip_id.contains("IdKind::Generic"));
+    }
+
+    /// Network CMSIS-DAP probes are selected by a placeholder VID:PID plus
+    /// their address, because USB enumeration can never find them.
+    #[test]
+    fn network_probe_selectors_cover_both_backends() {
+        let elk = parse_network_probe("dap.local").unwrap();
+        assert_eq!(elk.vendor_id, 0x0000);
+        assert_eq!(elk.product_id, 0x0002);
+        assert_eq!(elk.serial_number.as_deref(), Some("dap.local"));
+
+        // A bare host:port must not be mistaken for an explicit backend prefix.
+        let with_port = parse_network_probe("192.168.1.50:3240").unwrap();
+        assert_eq!(with_port.product_id, 0x0002);
+        assert_eq!(
+            with_port.serial_number.as_deref(),
+            Some("192.168.1.50:3240")
+        );
+
+        let tcp = parse_network_probe("tcp:127.0.0.1:4441").unwrap();
+        assert_eq!(tcp.product_id, 0x0001);
+        assert_eq!(tcp.serial_number.as_deref(), Some("127.0.0.1:4441"));
+
+        assert!(parse_network_probe("").is_none());
+        assert!(parse_network_probe("   ").is_none());
+        assert!(parse_network_probe("elaphurelink:").is_none());
+    }
+
+    #[test]
+    fn network_probe_entry_matches_the_stable_identity() {
+        let selector = parse_network_probe("elaphurelink:dap.local").unwrap();
+        let entry = network_probe_entry("elaphurelink:dap.local").unwrap();
+        assert_eq!(entry.id, network_probe_identity(&selector));
+        assert_eq!(entry.id, "0000:0002:dap.local::usb");
+        assert!(entry.label.contains("elaphureLink"));
+        assert!(network_probe_entry("").is_none());
+    }
+
+    /// Configs saved before network probes existed must still deserialise.
+    #[test]
+    fn older_settings_without_network_probe_still_load() {
+        let mut value = serde_json::to_value(FlashConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("network_probe");
+        let cfg: FlashConfig = serde_json::from_value(value).unwrap();
+        assert!(cfg.network_probe.is_empty());
+    }
+
+    #[test]
+    fn network_probe_is_opened_directly_without_usb_enumeration() {
+        let source = include_str!("backend.rs");
+        assert!(source.contains("parse_network_probe(&cfg.network_probe)"));
+        assert!(source.contains("Lister::new().open(selector)"));
+        assert!(source.contains("无法连接网络探针"));
+        let app = include_str!("app.rs");
+        assert!(app.contains("network_probe_entry"));
+        assert!(app.contains("网络探针（ElaphureLink"));
+        let main = include_str!("main.rs");
+        assert!(main.contains("--network"));
+        assert_eq!(main.matches("apply_network_cli(&mut cfg, &args)").count(), 4);
     }
 }

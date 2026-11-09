@@ -25,6 +25,7 @@ GUI 侧另有兜底：`Connect` / `ReadBack` / `Flash` / `VerifyFirmware` / `Era
 
 - **会话式布局**：左侧窄栏「当前会话」集中连接配置、固件选择、烧录选项与全部操作（可滚动）；右侧会话区是已载入固件的 16 进制查看器（虚拟滚动、8/16/32 字节每行、ASCII 栏、镜像 / 文件原始字节切换）
 - 探针枚举、按设备身份选择、连接测试；USB 插入/拔出自动检测（1.5 秒轮询 + 去抖），烧录期间自动暂停轮询
+- **网络探针（elaphureLink 无线下载器）**：fork 的 probe-rs 新增 TCP CMSIS-DAP 后端，按 OpenOCD `cmsis-dap backend elaphurelink` 的握手与 `0x88` vendor 帧收发；GUI 在「连接配置」填 `dap.local` 即可选中（详见「网络探针：elaphureLink」）
 - **烧录按钮常驻**：「开始烧录」固定在「当前会话」侧栏顶部、滚动区之外，滚到任何设置位置都能一键触达；全界面只有这一个烧录入口，避免重复控件
 - **固件可移除**：左栏「固件文件」标题行右侧、右侧固件信息卡片右上角各有一个**纯「✕」**关闭按钮（不带文字，悬停显示说明）；点击会清除当前固件、解码信息、16 进制缓冲，并清掉配置里保存的路径（下次启动不会自动载回）；「最近固件」记录还能逐条 ✕ 删除或一键清空
 - **日志可复制**：日志台「复制全部」把当前可见日志按时间顺序写进系统剪贴板，单条日志右键可「复制整行 / 只复制消息内容」，运行日志页也有「复制全部日志」；选中文字按 Ctrl+C 同样能粘贴到其它程序（详见「日志复制与剪贴板」）
@@ -451,6 +452,62 @@ OB 区 0x1FFF0E80 · 16 字节
 > 芯片 ID 与「选项字节」是两件事：前者只读识别硅片身份，后者会改写配置 NVM。
 > 两者共用同一套连接参数，但读取 ID 不会改变芯片任何内容。
 
+## 网络探针：elaphureLink 无线下载器
+
+[elaphureLink](https://github.com/windowsair/elaphureLink) 把一颗 CMSIS-DAP 调试器
+（如 wireless-esp8266-dap）桥接到 Wi-Fi：设备开一个 TCP 服务，主机用
+[openocd-elaphurelink](https://github.com/windowsair/openocd-elaphurelink) 的
+`cmsis-dap backend elaphurelink` 连上去。本项目的 `HaydenHu/probe-rs` fork 把同一套协议
+实现成 probe-rs 的一个 CMSIS-DAP 传输层，因此 GUI、CLI 与烧录链路都能直接用无线探针。
+
+### 协议（与 OpenOCD 实现一致）
+
+| 步骤 | 报文 |
+| --- | --- |
+| 连接 | TCP `host:3240`，默认 `dap.local`（可写 IP / `IP:端口` / mDNS 域名） |
+| 握手 | 发 12 字节大端 `0x8a656c70` + `0x00000000` + `0x00010000`（proxy 版本）；回包同 identifier / command，DAP 版本主版本 ≥ 1 |
+| 进入 vendor 域 | 发 `88 02 00 00`，等一个 status = 0 的 vendor 帧 |
+| 每条 CMSIS-DAP 命令 | 发 `88 01 <长度:u16 大端> <原始命令>`；回收 `88 <status> <长度:u16 大端> <原始响应>` |
+
+长度字段是**网络字节序**，载荷是不带 HID report id 的原始 CMSIS-DAP 命令/响应。
+单包上限按 OpenOCD 的以太网 MTU 取 1496 字节；若设备不回答 `DAP_Info(PacketSize)`，
+后端自动回退到 1496，而不是报 `NoPacketSize`。分片、迟到响应、坏帧头都有单测覆盖。
+
+### 在 GUI 里使用
+
+「当前会话」→「连接配置」→「网络探针」输入框填地址，点「应用」：
+
+- 直接写 `dap.local` / `192.168.1.50:3240` 默认按 **elaphureLink** 解析；
+- 也可显式写 `elaphurelink:dap.local` 或 `tcp:192.168.1.50:4441`（后者走 probe-rs 已有的
+  OpenOCD TCP backend，帧格式是 `DAP\0`）；
+- 应用后该探针会出现在上方「调试探针」下拉框里（占位 VID:PID `0000:0002`），选中即可连接、
+  烧录、读芯片 ID；点「清除」回到 USB 探针。
+
+网络探针不参与 USB 热插拔轮询，地址随 `probe-rs-studio.json` 持久化。
+
+### 命令行
+
+```text
+probe-rs-studio.exe --connect --network dap.local
+probe-rs-studio.exe --chip-id --network dap.local
+probe-rs-studio.exe --selftest firmware.hex --network 192.168.1.50:3240
+```
+
+不加 `--network` 时，headless 命令复用 GUI 保存的配置（包括已启用的网络探针）。
+在 probe-rs CLI 里等价写法是 `--probe 0000:0002:dap.local`。
+
+### 排错与验证状态
+
+连接失败会直接给出「检查设备已上电 / 地址可解析 / TCP 3240 可达 / 未被 OpenOCD 占用」
+的提示，不会像 USB 探针那样反复重试 3 次。
+
+- 已验证：协议层单测（握手、大端长度、分片重组、迟到响应、坏帧、超长包）与
+  **端到端集成测试**（模拟代理 → `CmsisDapFactory::open` → `DAP_Info` 序列 → 成功打开探针），
+  6/6 通过；GUI 侧 100 项单测通过，选择器 / 持久化 / CLI 接线均有回归测试。
+- **尚未真机验证**：当前没有 elaphureLink 硬件，实际无线链路延迟、mDNS 解析与设备端
+  `DAP_Info(PacketSize)` 行为需接上真机后再核对。若设备不回答该命令会自动回退到 1496 字节；
+  若 `.local` 无法解析，请改用设备 IP。
+
 ## 连接测试一直失败：DAPLink HID 固件死锁
 
 「连接测试 / 连接 / 烧录」全部卡住，日志里出现 `hidapi error: WinError: WaitTimedOut`
@@ -570,9 +627,9 @@ cargo test --release --bin probe-rs-studio
 ## 目录结构
 
 ```
-src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --connect / --ob-open / --id-open 分派
+src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --connect / --network / --ob-open / --id-open 分派
 src/app.rs        会话侧栏（顶部固定烧录按钮 / 固件卸载 / 最近固件删除）、16 进制查看器（卡片右上角纯「✕」）、串口终端（接收区 / 发送区标题行集成控制、定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、日志剪贴板复制与右键菜单、选项字节与芯片 ID 窗口、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
-src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、内核一致性核对、探针重新枚举与死锁识别、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
+src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、内核一致性核对、网络探针选择器解析与直连、探针重新枚举与死锁识别、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
 src/chip_id.rs    芯片 ID 寄存器预设与 CPUID / DPIDR / IDCODE / UID / FlashSize 解码、内核型号与芯片描述一致性判定、报告格式化（纯逻辑，可单测）
 src/option_bytes.rs  选项字节 16 字节镜像、字段编解码、反码维护、变更 diff 与安全校验（纯逻辑，可单测）
 src/pack.rs       CMSIS-Pack 转换器：ZIP / pdsc XML / ELF32 FLM / target YAML（纯 Rust）

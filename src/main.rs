@@ -54,6 +54,7 @@ fn main() -> eframe::Result<()> {
         // speed). A headless run with the bare 1000 kHz default would attach
         // under different conditions and cannot reproduce UI flash failures.
         let mut cfg = saved_flash_config().unwrap_or_default();
+        apply_network_cli(&mut cfg, &args);
         cfg.firmware = Some(std::path::PathBuf::from(firmware));
         if let Some(chip) = args.get(pos + 2).filter(|s| !s.starts_with("--")) {
             cfg.chip = chip.clone();
@@ -125,6 +126,7 @@ fn main() -> eframe::Result<()> {
         // speed). The bare defaults can pick a different probe/speed and make
         // a headless read behave differently from the UI.
         let mut cfg = saved_flash_config().unwrap_or_default();
+        apply_network_cli(&mut cfg, &args);
         if let Some(chip) = args.get(pos + 1).filter(|s| !s.starts_with("--")) {
             cfg.chip = chip.clone();
         }
@@ -147,6 +149,7 @@ fn main() -> eframe::Result<()> {
     // button, including the probe-open recovery and job-level retries.
     if let Some(pos) = args.iter().position(|a| a == "--connect") {
         let mut cfg = saved_flash_config().unwrap_or_default();
+        apply_network_cli(&mut cfg, &args);
         if let Some(chip) = args.get(pos + 1).filter(|s| !s.starts_with("--")) {
             cfg.chip = chip.clone();
         }
@@ -161,6 +164,7 @@ fn main() -> eframe::Result<()> {
     //   --chip-id [chip] [--speed N] [--id-addr 0x40015800]
     if let Some(pos) = args.iter().position(|a| a == "--chip-id") {
         let mut cfg = saved_flash_config().unwrap_or_default();
+        apply_network_cli(&mut cfg, &args);
         if let Some(chip) = args.get(pos + 1).filter(|s| !s.starts_with("--")) {
             cfg.chip = chip.clone();
         }
@@ -390,6 +394,17 @@ fn saved_flash_config() -> Option<backend::FlashConfig> {
     let path = exe.parent()?.join("probe-rs-studio.json");
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     serde_json::from_value(value.get("config")?.clone()).ok()
+}
+
+/// `--network <addr>` selects a network CMSIS-DAP probe for headless commands.
+/// Without it the saved GUI configuration (which may already name one) is used.
+fn apply_network_cli(cfg: &mut backend::FlashConfig, args: &[String]) {
+    if let Some(address) = cli_opt(args, "--network") {
+        cfg.network_probe = address;
+        if let Some(selector) = backend::parse_network_probe(&cfg.network_probe) {
+            cfg.probe_id = Some(backend::network_probe_identity(&selector));
+        }
+    }
 }
 
 /// Fetch a `--key value` pair from the argument list.
