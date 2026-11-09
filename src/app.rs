@@ -843,19 +843,25 @@ impl App {
         received
     }
 
+    /// Keep the network probe visible in the dropdown as the address field is
+    /// edited. USB polling never reports it, so relying on a refresh job alone
+    /// made the entry appear only after pressing 「应用」.
+    fn sync_network_probe_entry(&mut self) {
+        // Placeholder VID:PIDs are reserved for network backends; USB polling
+        // never produces them, so a changed address replaces the stale entry.
+        self.probes
+            .retain(|x| !x.id.starts_with("0000:0001:") && !x.id.starts_with("0000:0002:"));
+        if let Some(entry) = backend::network_probe_entry(&self.cfg.network_probe) {
+            self.probes.push(entry);
+        }
+    }
+
     /// Replace the probe list while keeping the *same physical probe* selected.
     /// Returns whether that probe is still attached.
     fn apply_probes(&mut self, items: Vec<ProbeItem>) -> bool {
         let chosen = self.cfg.probe_id.clone();
-        let mut items = items;
-        // Network probes cannot be found by USB polling, so keep the configured
-        // one in the dropdown on every refresh.
-        if let Some(entry) = backend::network_probe_entry(&self.cfg.network_probe) {
-            if !items.iter().any(|x| x.id == entry.id) {
-                items.push(entry);
-            }
-        }
         self.probes = items;
+        self.sync_network_probe_entry();
         if self.probes.is_empty() {
             self.cfg.probe_index = 0;
             return false;
@@ -1399,6 +1405,7 @@ impl App {
     }
 
     fn session_connection(&mut self, ui: &mut Ui, p: Palette) {
+        self.sync_network_probe_entry();
         Self::section_title(ui, p, "连接配置");
         ui.add_space(6.0);
         ui.label(RichText::new("调试探针").size(10.0).color(p.text3));
@@ -1473,11 +1480,7 @@ impl App {
                     Level::Info,
                     format!("已启用网络探针: {}", self.cfg.network_probe),
                 );
-                if let Some(entry) = backend::network_probe_entry(&self.cfg.network_probe) {
-                    if !self.probes.iter().any(|x| x.id == entry.id) {
-                        self.probes.push(entry);
-                    }
-                }
+                self.sync_network_probe_entry();
             } else {
                 self.cfg.probe_id = None;
                 self.connection = None;

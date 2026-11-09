@@ -57,7 +57,9 @@ pub struct FlashConfig {
     /// Address of a network CMSIS-DAP probe, e.g. `dap.local` for an
     /// elaphureLink wireless debugger. Empty means USB probes only.
     /// `probe_id` decides whether it is actually the selected probe.
-    #[serde(default)]
+    /// Defaults to the same address as OpenOCD's `elaphurelink.cfg`, so the
+    /// network probe is visible in the dropdown without any setup.
+    #[serde(default = "default_network_probe")]
     pub network_probe: String,
     pub chip: String,
     pub protocol: Protocol,
@@ -82,12 +84,17 @@ pub struct FlashConfig {
     pub backup_path: PathBuf,
 }
 
+/// OpenOCD's `elaphurelink.cfg` uses `dap.local` as the default device address.
+pub fn default_network_probe() -> String {
+    "dap.local".to_owned()
+}
+
 impl Default for FlashConfig {
     fn default() -> Self {
         Self {
             probe_index: 0,
             probe_id: None,
-            network_probe: String::new(),
+            network_probe: default_network_probe(),
             chip: "PY32F003x8".to_owned(),
             protocol: Protocol::Swd,
             speed_khz: 1000,
@@ -2346,13 +2353,22 @@ mod tests {
         assert!(network_probe_entry("").is_none());
     }
 
-    /// Configs saved before network probes existed must still deserialise.
+    /// Configs saved before network probes existed must still deserialise,
+    /// and get the same default address as a fresh install.
     #[test]
     fn older_settings_without_network_probe_still_load() {
         let mut value = serde_json::to_value(FlashConfig::default()).unwrap();
         value.as_object_mut().unwrap().remove("network_probe");
         let cfg: FlashConfig = serde_json::from_value(value).unwrap();
-        assert!(cfg.network_probe.is_empty());
+        assert_eq!(cfg.network_probe, "dap.local");
+    }
+
+    /// The address is prefilled so the network probe shows up in the dropdown
+    /// without any manual setup (OpenOCD's elaphurelink.cfg default).
+    #[test]
+    fn network_probe_defaults_to_the_openocd_address() {
+        assert_eq!(FlashConfig::default().network_probe, "dap.local");
+        assert!(network_probe_entry(&FlashConfig::default().network_probe).is_some());
     }
 
     #[test]
@@ -2363,6 +2379,7 @@ mod tests {
         assert!(source.contains("无法连接网络探针"));
         let app = include_str!("app.rs");
         assert!(app.contains("network_probe_entry"));
+        assert!(app.contains("sync_network_probe_entry"));
         assert!(app.contains("网络探针（ElaphureLink"));
         let main = include_str!("main.rs");
         assert!(main.contains("--network"));
