@@ -549,13 +549,19 @@ probe-rs-studio.exe --network-check dap.local
 - **设备 Web 配置页在线 ≠ DAP 服务在线**：无线 DAP 的 `http://<设备IP>/` 配置页能打开，
   只说明 WiFi 与 HTTP 正常；3240 的 DAP 任务可能因上一次异常断连卡死，需要给设备断电重启。
 
-- 已验证：协议层单测（握手、大端长度、分片重组、迟到响应、坏帧、超长包）与
-  **端到端集成测试**（模拟代理 → `CmsisDapFactory::open` → `DAP_Info` 序列 → 成功打开探针），
-  6/6 通过；GUI 侧 100 项单测通过，选择器 / 持久化 / CLI 接线均有回归测试。
-- **真机状态（2026-11-10）**：无线 DAP 已在局域网出现（`dap.local → 192.168.5.5`，
-  Web 配置页 `Wireless DAP - WiFi` 可访问），但关闭占用它的 OpenOCD 后 TCP 3240 仍只在
-  极短窗口开放、且连上也不回握手，判断为设备端 DAP 服务卡死，需断电重启后再验。
-  因此**完整烧录链路仍未在真机上跑通**；协议层 6/6 单测与端到端模拟代理测试已通过。
+- 已验证：协议层单测（握手、大端长度、分片重组、迟到响应、坏帧、超长包、分阶段错误）
+  与**端到端集成测试**（模拟代理 → `CmsisDapFactory::open` → `DAP_Info` 序列 → 成功打开探针），
+  8/8 通过；GUI 侧 106 项单测通过，选择器 / 持久化 / CLI 接线均有回归测试。
+- **真机验证通过（2026-11-10）**：设备断电重启后 `--network-check dap.local` 报
+  「握手成功（代理版本 1.0）· vendor scope status 0」；`--connect --network dap.local`
+  连续 **4/4 `[PASS]`**（`PY32F003x8 · Armv6m · SWD 10000 kHz ·
+  SP=0x20002000 PC=0x08000419`）；`--chip-id` 读到 `DPIDR=0x0BC11477`、
+  `CPUID=0x410CC601`（Cortex-M0+，与 Armv6m 一致）、`DBGMCU_IDCODE=0x60001000`、
+  96 位 UID 与 55 KiB Flash 容量。完整**只读自检**
+  `--selftest <固件> --network dap.local` 也是全绿：连接测试、4096 字节读回备份、
+  1432 字节独立读回校验（`读回完全一致`）全部 `[PASS]`。
+  **烧录 / 写入校验尚未在无线链路上实测**，但连接与 SWD 批量读链路已完整跑通。
+  此前设备因异常断连卡死（TCP 3240 只在极短窗口开放、连上也不回握手），断电重启后恢复；
   若设备不回答 `DAP_Info(PacketSize)` 会自动回退到 1496 字节；`.local` 解析不了就改用设备 IP。
 
 ## 连接测试一直失败：DAPLink HID 固件死锁
