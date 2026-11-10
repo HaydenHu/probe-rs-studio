@@ -302,6 +302,19 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // Headless live monitor for the configured network probe.
+    if let Some(pos) = args.iter().position(|a| a == "--network-watch") {
+        let secs = args
+            .get(pos + 1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+        let address = cli_opt(&args, "--network")
+            .or_else(|| saved_flash_config().map(|cfg| cfg.network_probe))
+            .unwrap_or_else(|| "dap.local".to_owned());
+        backend::network_watch_cli(&address, std::time::Duration::from_secs(secs));
+        std::process::exit(0);
+    }
+
     // Headless hot-plug diagnostic: probe-rs-studio.exe --watch <seconds>
     if let Some(pos) = args.iter().position(|a| a == "--watch") {
         let secs = args

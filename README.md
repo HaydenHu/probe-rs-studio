@@ -511,6 +511,24 @@ OB 区 0x1FFF0E80 · 16 字节
 网络探针不参与 USB 热插拔轮询，地址随 `probe-rs-studio.json` 持久化；旧配置缺该字段时
 也会自动补上 `dap.local`。
 
+#### 实时在线检测
+
+配置了网络探针地址后，后台线程会**实时检测它是否在线**：「网络探针」标题行右侧有
+绿 / 红 / 灰状态点（在线 / 离线 / 检测中），悬停显示最后一次探测结果与时间；
+探针下拉项也带「· 在线 / · 离线」后缀；上线 / 离线切换会像 USB 热插拔一样写一条日志。
+
+- 探测是**一次裸 TCP connect（600 ms 超时）后立即关闭，不发 elaphureLink 握手**——
+  代理只接受一个客户端，为「问在不在」而开一个 DAP 会话会抢走真实烧录的连接槽。
+- 复用「自动检测设备」开关与 `WatcherControl`：连接 / 烧录 / 读回等任务执行期间**暂停探测**，
+  关闭自动检测也一并停止。
+- 在线时每 **3 秒**轮询一次，离线时降频到 **8 秒**并重新解析 mDNS（兼容设备重启后换 IP）；
+  只在状态翻转时发事件，不重复刷界面。
+- 「在线」只表示 **TCP 3240 可接受连接**，不保证 elaphureLink 握手一定成功
+  （设备 Web 配置页在线、DAP 任务卡死时端口仍可能 accept）。要确认协议可用，
+  再点「诊断连接…」或连接测试。
+- headless 等价命令：`probe-rs-studio.exe --network-watch 60 --network dap.local`，
+  可边给设备断电 / 上电边观察 `[在线] / [离线]` 变化。
+
 #### 连不上时先点「诊断连接…」
 
 输入框下方有「诊断连接…」按钮（后台执行，不卡界面），把结果逐行写进日志台：
@@ -683,9 +701,9 @@ cargo test --release --bin probe-rs-studio
 ## 目录结构
 
 ```
-src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --connect / --network-check / --network / --ob-open / --id-open 分派
+src/main.rs       入口、窗口配置、--selftest / --watch / --network-watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --connect / --network-check / --network / --ob-open / --id-open 分派
 src/app.rs        会话侧栏（顶部固定烧录按钮 / 固件卸载 / 快捷操作）、16 进制查看器（固件信息卡片左右分栏：左栏详情 + 右栏最近固件紧凑按钮组、右上角纯「✕」）、串口终端（接收区 / 发送区标题行集成控制、定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、日志剪贴板复制与右键菜单、选项字节与芯片 ID 窗口、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
-src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、内核一致性核对、网络探针选择器解析与直连及分阶段诊断（解析/TCP/握手/端口占用）、探针重新枚举与死锁识别、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
+src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、内核一致性核对、网络探针选择器解析与直连、分阶段诊断（解析/TCP/握手/端口占用）与实时在线监视、探针重新枚举与死锁识别、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
 src/chip_id.rs    芯片 ID 寄存器预设与 CPUID / DPIDR / IDCODE / UID / FlashSize 解码、内核型号与芯片描述一致性判定、报告格式化（纯逻辑，可单测）
 src/option_bytes.rs  选项字节 16 字节镜像、字段编解码、反码维护、变更 diff 与安全校验（纯逻辑，可单测）
 src/pack.rs       CMSIS-Pack 转换器：ZIP / pdsc XML / ELF32 FLM / target YAML（纯 Rust）

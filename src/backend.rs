@@ -192,6 +192,13 @@ pub enum Job {
 pub enum Event {
     Log(Level, String),
     Probes(Vec<ProbeItem>),
+    /// Live reachability of the configured network probe. Emitted only when
+    /// the online/offline state changes, so the UI does not repaint per tick.
+    NetworkProbeStatus {
+        address: String,
+        online: bool,
+        detail: String,
+    },
     /// A confirmed hot-plug / hot-unplug transition from the watcher.
     ProbeHotplug {
         items: Vec<ProbeItem>,
@@ -946,6 +953,165 @@ pub fn spawn_serial_session(
             );
             let _ = tx.send(Event::SerialClosed(reason));
         });
+}
+
+/// Address shared between the UI and the network-probe watcher. A plain
+/// mutex is enough: it is written once per frame and read every few seconds.
+pub type SharedNetworkAddress = Arc<std::sync::Mutex<String>>;
+
+/// Resolve a configured network probe to concrete socket addresses. The
+/// placeholder backend decides the default port (elaphureLink 3240, the
+/// generic CMSIS-DAP TCP backend 4441).
+pub fn resolve_network_probe_address(text: &str) -> Vec<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+
+    let Some(selector) = parse_network_probe(text) else {
+        return Vec::new();
+    };
+    let host = selector.serial_number.as_deref().unwrap_or("");
+    let port = if selector.product_id == NETWORK_ELAPHURELINK_PID {
+        3240u16
+    } else {
+        4441u16
+    };
+    match host.to_socket_addrs() {
+        Ok(list) => list.collect(),
+        Err(_) => (host, port)
+            .to_socket_addrs()
+            .map(|list| list.collect())
+            .unwrap_or_default(),
+    }
+}
+
+/// A bare TCP connect, deliberately WITHOUT the elaphureLink handshake.
+/// The proxy serves exactly one client, so starting a DAP session just to
+/// ask "are you there?" could steal the slot from a real flashing job.
+pub fn network_probe_reachable(addresses: &[std::net::SocketAddr]) -> (bool, String) {
+    use std::net::TcpStream;
+
+    let mut last = "未解析到地址".to_owned();
+    for address in addresses {
+        match TcpStream::connect_timeout(address, Duration::from_millis(600)) {
+            Ok(stream) => {
+                drop(stream);
+                return (true, format!("TCP {address} 可达"));
+            }
+            Err(err) => last = format!("TCP {address}: {err}"),
+        }
+    }
+    (false, last)
+}
+
+/// Poll the configured network probe and report online/offline transitions.
+///
+/// The watcher shares `WatcherControl` with the USB hot-plug watcher, so it is
+/// suspended while a job owns the debugger and when the user turns off
+/// automatic device detection. Polling backs off from 3 s (online) to 8 s
+/// (offline), and a failed lookup forces mDNS re-resolution on the next tick
+/// so a device that changed IP after a reboot is found again.
+pub fn spawn_network_probe_watcher(
+    tx: Sender<Event>,
+    control: Arc<WatcherControl>,
+    address: SharedNetworkAddress,
+    notify: impl Fn() + Send + Sync + 'static,
+) {
+    const ONLINE_POLL: Duration = Duration::from_secs(3);
+    const OFFLINE_POLL: Duration = Duration::from_secs(8);
+    let _ = std::thread::Builder::new()
+        .name("network-probe-watch".to_owned())
+        .spawn(move || {
+            log(
+                &tx,
+                Level::Debug,
+                "网络探针在线检测已启动 · 在线 3s / 离线 8s 轮询，任务执行期间暂停",
+            );
+            let mut last: Option<bool> = None;
+            let mut cached_text = String::new();
+            let mut cached_addrs: Vec<std::net::SocketAddr> = Vec::new();
+            loop {
+                if !control.enabled.load(Ordering::Relaxed)
+                    || control.busy.load(Ordering::Relaxed)
+                {
+                    std::thread::sleep(ONLINE_POLL);
+                    continue;
+                }
+                let text = address
+                    .lock()
+                    .map(|guard| guard.trim().to_owned())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    if last.is_some() {
+                        let _ = tx.send(Event::NetworkProbeStatus {
+                            address: String::new(),
+                            online: false,
+                            detail: "未配置网络探针地址".to_owned(),
+                        });
+                        last = None;
+                        notify();
+                    }
+                    cached_text.clear();
+                    cached_addrs.clear();
+                    std::thread::sleep(ONLINE_POLL);
+                    continue;
+                }
+                if text != cached_text || cached_addrs.is_empty() {
+                    cached_text = text.clone();
+                    cached_addrs = resolve_network_probe_address(&text);
+                }
+                let (online, detail) = network_probe_reachable(&cached_addrs);
+                if !online {
+                    cached_addrs.clear();
+                }
+                if last != Some(online) {
+                    log(
+                        &tx,
+                        if online { Level::Ok } else { Level::Warn },
+                        format!(
+                            "网络探针 {text} {} · {detail}",
+                            if online { "已上线" } else { "已离线" }
+                        ),
+                    );
+                    let _ = tx.send(Event::NetworkProbeStatus {
+                        address: text.clone(),
+                        online,
+                        detail,
+                    });
+                    notify();
+                    last = Some(online);
+                }
+                std::thread::sleep(if online { ONLINE_POLL } else { OFFLINE_POLL });
+            }
+        });
+}
+
+/// Headless live monitor: probe-rs-studio.exe --network-watch [seconds].
+pub fn network_watch_cli(address: &str, duration: Duration) {
+    let (tx, rx) = mpsc::channel();
+    let control = Arc::new(WatcherControl::new(true));
+    let shared: SharedNetworkAddress =
+        Arc::new(std::sync::Mutex::new(address.to_owned()));
+    spawn_network_probe_watcher(tx, control, shared, || {});
+    println!(
+        "网络探针在线检测: {address}（{} 秒，可插拔/断电设备观察状态变化）…",
+        duration.as_secs()
+    );
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Event::NetworkProbeStatus {
+                address,
+                online,
+                detail,
+            }) => println!(
+                "[{}] {} · {}",
+                if online { "在线" } else { "离线" },
+                address,
+                detail
+            ),
+            Ok(Event::Log(_, msg)) => println!("  {msg}"),
+            Ok(_) | Err(_) => {}
+        }
+    }
 }
 
 /// Watch USB debug probes and push a fresh list whenever a probe is plugged in
@@ -2621,6 +2787,18 @@ mod tests {
         assert!(network_check("").contains("为空"));
         assert!(network_check("tcp:127.0.0.1:1").contains("4441"));
         assert!(network_check("dap.local").contains("3240"));
+    }
+
+
+    #[test]
+    fn network_watcher_resolves_backend_ports() {
+        let tcp: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert_eq!(resolve_network_probe_address("tcp:127.0.0.1:1"), vec![tcp]);
+        let elaphure = resolve_network_probe_address("192.168.5.5:3240");
+        assert_eq!(elaphure[0].port(), 3240);
+        let (online, detail) = network_probe_reachable(&[tcp]);
+        assert!(!online);
+        assert!(detail.contains("127.0.0.1:1"));
     }
 
 }

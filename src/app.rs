@@ -439,6 +439,11 @@ pub struct App {
     auto_detect: bool,
     watch: Arc<WatcherControl>,
     last_hotplug: Option<String>,
+    /// Live reachability of the configured network probe (runtime only).
+    network_online: Option<bool>,
+    network_status: String,
+    network_checked_at: String,
+    network_address: backend::SharedNetworkAddress,
     nav: Nav,
     probes: Vec<ProbeItem>,
     chips: Vec<ChipItem>,
@@ -613,8 +618,11 @@ impl App {
 
         let (tx, rx) = channel();
         let watch = Arc::new(WatcherControl::new(s.auto_detect));
+        let network_address: backend::SharedNetworkAddress =
+            Arc::new(std::sync::Mutex::new(s.config.network_probe.clone()));
         let repaint_ctx = cc.egui_ctx.clone();
         let serial_repaint_ctx = repaint_ctx.clone();
+        let network_repaint_ctx = repaint_ctx.clone();
         let mut app = Self {
             icons: IconSet::load(),
             cfg: s.config,
@@ -623,6 +631,10 @@ impl App {
             auto_detect: s.auto_detect,
             watch: watch.clone(),
             last_hotplug: None,
+            network_online: None,
+            network_status: "尚未检测".to_owned(),
+            network_checked_at: String::new(),
+            network_address: network_address.clone(),
             nav: Nav::Workbench,
             probes: vec![],
             chips: vec![],
@@ -717,6 +729,12 @@ impl App {
         );
         // COM ports (including a DAPLink's built-in virtual COM port) are
         // watched separately: registry/PnP reads never contend with the probe.
+        backend::spawn_network_probe_watcher(
+            app.tx.clone(),
+            watch.clone(),
+            network_address,
+            move || network_repaint_ctx.request_repaint(),
+        );
         backend::spawn_serial_watcher(
             app.tx.clone(),
             watch,
@@ -756,6 +774,17 @@ impl App {
                 Event::Log(level, msg) => self.push_log(level, msg),
                 Event::Probes(items) => {
                     self.apply_probes(items);
+                }
+                Event::NetworkProbeStatus {
+                    address,
+                    online,
+                    detail,
+                } => {
+                    self.network_online = if address.is_empty() { None } else { Some(online) };
+                    self.network_status = detail;
+                    self.network_checked_at =
+                        chrono::Local::now().format("%H:%M:%S").to_string();
+                    self.sync_network_probe_entry();
                 }
                 Event::ProbeHotplug { items, added, removed } => {
                     let was_ready = self.probe_ready();
@@ -851,7 +880,18 @@ impl App {
         // never produces them, so a changed address replaces the stale entry.
         self.probes
             .retain(|x| !x.id.starts_with("0000:0001:") && !x.id.starts_with("0000:0002:"));
-        if let Some(entry) = backend::network_probe_entry(&self.cfg.network_probe) {
+        if let Some(mut entry) = backend::network_probe_entry(&self.cfg.network_probe) {
+            match self.network_online {
+                Some(true) => {
+                    entry.label.push_str(" · 在线");
+                    entry.detail.push_str(" · TCP 可达");
+                }
+                Some(false) => {
+                    entry.label.push_str(" · 离线");
+                    entry.detail.push_str(" · 端口不可达");
+                }
+                None => {}
+            }
             self.probes.push(entry);
         }
     }
@@ -1445,11 +1485,34 @@ impl App {
                 }
             });
         ui.add_space(6.0);
-        ui.label(
-            RichText::new("网络探针（ElaphureLink / CMSIS-DAP TCP）")
-                .size(10.0)
-                .color(p.text3),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("网络探针（ElaphureLink / CMSIS-DAP TCP）")
+                    .size(10.0)
+                    .color(p.text3),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (color, text) = match self.network_online {
+                    Some(true) => (p.success, "在线"),
+                    Some(false) => (p.error, "离线"),
+                    None => (p.text3, "检测中"),
+                };
+                let hint = format!(
+                    "{} · 上次检测 {}\n实时检测：空闲时每 3 秒、离线时每 8 秒；任务执行期间暂停",
+                    self.network_status,
+                    if self.network_checked_at.is_empty() {
+                        "—"
+                    } else {
+                        &self.network_checked_at
+                    }
+                );
+                ui.add(egui::Label::new(RichText::new(text).size(9.0).color(color)))
+                    .on_hover_text(hint.as_str());
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(7.0, 7.0), Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, color);
+            });
+        });
         let mut apply_network = false;
         let mut clear_network = false;
         ui.horizontal(|ui| {
@@ -4204,6 +4267,13 @@ impl eframe::App for App {
         // Keep a clone of the context for input, repaint and global style calls.
         let ctx = root.ctx().clone();
         let got_events = self.pump();
+        // Keep the live reachability watcher pointed at the address currently
+        // being edited; it re-resolves and re-probes on change.
+        if let Ok(mut shared) = self.network_address.lock() {
+            if *shared != self.cfg.network_probe {
+                *shared = self.cfg.network_probe.clone();
+            }
+        }
         // Periodic sending is driven by frames rather than a second thread.
         // Must run before drawing so the send box and counters are current.
         self.tick_serial_timer();
@@ -5192,6 +5262,27 @@ mod tests {
         }
         assert!(include_str!("app.rs").contains("诊断连接…"));
         assert!(include_str!("main.rs").contains("--network-check"));
+    }
+
+
+    /// Network probes have no USB plug/unplug events, so reachability is
+    /// polled in the background and surfaced as a live status dot + log line.
+    #[test]
+    fn network_probe_online_state_is_live() {
+        let app = include_str!("app.rs");
+        for needle in [
+            "spawn_network_probe_watcher",
+            "Event::NetworkProbeStatus",
+            "network_online",
+            "network_address",
+        ] {
+            assert!(app.contains(needle), "live network status missing {needle}");
+        }
+        let backend = include_str!("backend.rs");
+        for needle in ["network_probe_reachable", "ONLINE_POLL", "OFFLINE_POLL"] {
+            assert!(backend.contains(needle), "watcher missing {needle}");
+        }
+        assert!(include_str!("main.rs").contains("--network-watch"));
     }
 
 }
