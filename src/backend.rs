@@ -160,6 +160,8 @@ pub enum Job {
         spec: Box<FlmSpec>,
     },
     Connect(Box<FlashConfig>),
+    /// Read-only network reachability / handshake diagnostic.
+    NetworkCheck(String),
     ReadBack(Box<FlashConfig>),
     Flash(Box<FlashConfig>),
     VerifyFirmware(Box<FlashConfig>),
@@ -430,6 +432,12 @@ fn run_once(job: Job, tx: &Sender<Event>) -> Result<String> {
             let summary = describe_session(&mut session)?;
             Ok(summary)
         }
+        Job::NetworkCheck(address) => {
+            for line in network_check(&address).lines() {
+                log(tx, Level::Info, line.to_owned());
+            }
+            Ok("网络探针诊断完成".to_owned())
+        }
         Job::ReadBack(cfg) => read_back(&cfg, tx),
         Job::Flash(cfg) => flash(&cfg, tx),
         Job::VerifyFirmware(cfg) => {
@@ -548,6 +556,227 @@ pub fn network_probe_entry(text: &str) -> Option<ProbeItem> {
         label: format!("{name}  [0000:{:04x}]", selector.product_id),
         detail: format!("{address} · 网络 CMSIS-DAP 探针（不参与 USB 热插拔检测）"),
     })
+}
+
+/// Diagnose a configured network probe without opening it through probe-rs.
+///
+/// "connection timed out" can come from mDNS resolution, the TCP handshake or
+/// the elaphureLink application handshake. Reporting each stage separately,
+/// plus processes already holding a connection to that port, turns a generic
+/// timeout into an actionable message.
+pub fn network_check(address: &str) -> String {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let mut out = String::new();
+    let Some(selector) = parse_network_probe(address) else {
+        return format!("网络探针诊断: 地址「{address}」为空或格式无效");
+    };
+    let host = selector.serial_number.as_deref().unwrap_or("");
+    let elaphure = selector.product_id == NETWORK_ELAPHURELINK_PID;
+    let port = if elaphure { 3240u16 } else { 4441u16 };
+    out.push_str(&format!(
+        "网络探针诊断: {address}（{} · TCP {port}）\n",
+        if elaphure { "elaphureLink" } else { "CMSIS-DAP TCP" }
+    ));
+
+    // Stage 1: DNS / mDNS lookup. Windows .local resolution can take seconds,
+    // which is part of why a failed GUI connection felt like a hang.
+    let started = Instant::now();
+    let resolved: Vec<_> = match host.to_socket_addrs() {
+        Ok(list) => list.collect(),
+        Err(_) => match (host, port).to_socket_addrs() {
+            Ok(list) => list.collect(),
+            Err(err) => {
+                out.push_str(&format!("[1/3] 地址解析失败: {err}\n"));
+                out.push_str(
+                    "结论: mDNS `.local` 未发现设备或 DNS 不通；确认设备已上电并连上同一局域网，或直接填设备 IP。\n",
+                );
+                return out;
+            }
+        },
+    };
+    if resolved.is_empty() {
+        out.push_str("[1/3] 地址解析结果为空\n结论: 未解析到任何 IP，请改用设备 IP。\n");
+        return out;
+    }
+    let list = resolved
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!(
+        "[1/3] 解析 {host} → {list}（{:.2} s）\n",
+        started.elapsed().as_secs_f32()
+    ));
+
+    // Stage 2: TCP connect to each resolved address.
+    let mut stream = None;
+    for addr in &resolved {
+        let t = Instant::now();
+        match TcpStream::connect_timeout(addr, Duration::from_secs(2)) {
+            Ok(s) => {
+                out.push_str(&format!(
+                    "[2/3] TCP 连接 {addr} → 成功（{:.2} s）\n",
+                    t.elapsed().as_secs_f32()
+                ));
+                stream = Some(s);
+                break;
+            }
+            Err(err) => out.push_str(&format!(
+                "[2/3] TCP 连接 {addr} → {err}（{:.2} s）\n",
+                t.elapsed().as_secs_f32()
+            )),
+        }
+    }
+    let Some(mut stream) = stream else {
+        let owners = port_owners(port);
+        if !owners.is_empty() {
+            out.push_str(&format!(
+                "[占用] 本机已有进程连着 TCP {port}: {}\n",
+                owners.join("、")
+            ));
+        }
+        if let Some(listener) = local_listener(port) {
+            out.push_str(&format!(
+                "[注意] 本机 TCP {port} 正由 {listener} 监听；填 127.0.0.1 / localhost 会连到它而不是无线 DAP\n"
+            ));
+        }
+        out.push_str(
+            "结论: probe-rs 还没发出握手就失败了。elaphureLink 代理通常只接受一个客户端——若上方列出已连接进程，先退出它；若设备刚被异常断开，请给无线 DAP 断电重启（Web 配置页能打开不代表 DAP 服务已启动）。\n",
+        );
+        return out;
+    };
+
+    if !elaphure {
+        out.push_str(
+            "[3/3] 端口可达；CMSIS-DAP TCP backend 使用 DAP 帧，可直接尝试连接测试。\n",
+        );
+        return out;
+    }
+
+    // Stage 3: application-level handshake. This connection is closed as soon
+    // as the report is done, so it never blocks a later real connection.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let request = [0x8a, 0x65, 0x6c, 0x70, 0, 0, 0, 0, 0, 1, 0, 0];
+    let mut reply = [0u8; 12];
+    match stream
+        .write_all(&request)
+        .and_then(|_| stream.read_exact(&mut reply))
+    {
+        Ok(_) if reply[..8] == [0x8a, 0x65, 0x6c, 0x70, 0, 0, 0, 0] => {
+            let version = u32::from_be_bytes(reply[8..12].try_into().unwrap());
+            out.push_str(&format!(
+                "[3/3] elaphureLink 握手成功（代理版本 {}.{}）\n",
+                (version >> 16) & 0xffff,
+                (version >> 8) & 0xff
+            ));
+            let mut scope = [0u8; 4];
+            match stream
+                .write_all(&[0x88, 0x02, 0, 0])
+                .and_then(|_| stream.read_exact(&mut scope))
+            {
+                Ok(_) => out.push_str(&format!(
+                    "vendor scope 回复 {:02x?}（status {}）\n",
+                    scope, scope[1]
+                )),
+                Err(err) => out.push_str(&format!("vendor scope 无响应: {err}\n")),
+            }
+            out.push_str("结论: 设备协议正常，可用「连接测试」连接该探针。\n");
+        }
+        Ok(_) => out.push_str(&format!(
+            "[3/3] 端口可达但回执不是 elaphureLink 握手: {:02x?}\n结论: TCP {port} 上是别的服务。\n",
+            &reply[..8]
+        )),
+        Err(err) => {
+            out.push_str(&format!("[3/3] TCP 已连通，但没有收到 12 字节握手: {err}\n"));
+            out.push_str(
+                "结论: 端口上的服务不是可用的 elaphureLink 代理（usbipd-win 也默认占用 3240），或设备端 DAP 服务卡死，需要给设备断电重启。\n",
+            );
+        }
+    }
+    out
+}
+
+/// Lines from `netstat -ano`; IP/state/PID fields are ASCII on every locale.
+fn netstat_lines() -> Vec<String> {
+    std::process::Command::new("netstat")
+        .args(["-ano"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|line| line.to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn pid_name(pid: u32) -> String {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let first = text.lines().next()?;
+            Some(
+                first
+                    .split(',')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"')
+                    .to_owned(),
+            )
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "未知进程".to_owned())
+}
+
+/// Processes holding an ESTABLISHED connection to `port` (the usual reason a
+/// single-client elaphureLink proxy refuses a second connection).
+fn port_owners(port: u16) -> Vec<String> {
+    let needle = format!(":{port}");
+    let mut pids = Vec::new();
+    for line in netstat_lines() {
+        let upper = line.to_ascii_uppercase();
+        if upper.contains("ESTABLISHED") && line.contains(&needle) {
+            if let Some(pid) = line
+                .split_whitespace()
+                .last()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    pids.into_iter()
+        .map(|pid| format!("{} (PID {pid})", pid_name(pid)))
+        .collect()
+}
+
+/// Process listening locally on `port`, if any. usbipd-win also uses 3240,
+/// so pointing the address at localhost silently reaches the wrong service.
+fn local_listener(port: u16) -> Option<String> {
+    let needle = format!(":{port}");
+    for line in netstat_lines() {
+        let upper = line.to_ascii_uppercase();
+        if upper.contains("LISTENING") && line.contains(&needle) {
+            if let Some(pid) = line
+                .split_whitespace()
+                .last()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                return Some(format!("{} (PID {pid})", pid_name(pid)));
+            }
+        }
+    }
+    None
 }
 
 /// Enumerate probes without opening them. Safe to call repeatedly from a
@@ -1215,8 +1444,9 @@ fn open_probe(cfg: &FlashConfig, tx: &Sender<Event>) -> Result<Probe> {
             return Lister::new().open(selector).map_err(|err| {
                 let text = format!("{:#}", anyhow::Error::from(err));
                 anyhow!(
-                    "无法连接网络探针 {}。请确认设备已上电、地址可解析、TCP 端口可达\
-                     （elaphureLink 默认 3240），且未被 OpenOCD 等程序占用。\n原始错误：{text}",
+                    "无法连接网络探针 {}。请在「连接配置」点「诊断连接…」看失败发生在解析 / TCP / 握手哪一步；\
+                     常见原因是 elaphureLink 代理只接受一个客户端（被 OpenOCD 等程序占用）、\
+                     设备未上电或 DAP 服务未启动。若要使用本机 USB 调试器，请在上方下拉框切换。\n原始错误：{text}",
                     cfg.network_probe
                 )
             });
@@ -2385,4 +2615,12 @@ mod tests {
         assert!(main.contains("--network"));
         assert_eq!(main.matches("apply_network_cli(&mut cfg, &args)").count(), 4);
     }
+
+    #[test]
+    fn network_check_reports_backend_and_handles_bad_addresses() {
+        assert!(network_check("").contains("为空"));
+        assert!(network_check("tcp:127.0.0.1:1").contains("4441"));
+        assert!(network_check("dap.local").contains("3240"));
+    }
+
 }

@@ -511,12 +511,26 @@ OB 区 0x1FFF0E80 · 16 字节
 网络探针不参与 USB 热插拔轮询，地址随 `probe-rs-studio.json` 持久化；旧配置缺该字段时
 也会自动补上 `dap.local`。
 
+#### 连不上时先点「诊断连接…」
+
+输入框下方有「诊断连接…」按钮（后台执行，不卡界面），把结果逐行写进日志台：
+
+| 阶段 | 报告内容 |
+| --- | --- |
+| `[1/3]` | mDNS / DNS 解析结果与耗时（Windows 上 `.local` 解析可能就要 2–3 秒） |
+| `[2/3]` | 逐个 IP 的 TCP 连接结果；失败时列出**已连着该端口的进程**和本机 3240 的监听者 |
+| `[3/3]` | elaphureLink 12 字节握手与 vendor scope 回复、代理版本 |
+
+诊断连接用完立刻关闭，不会长期占用设备。等价的命令行是
+`probe-rs-studio.exe --network-check [地址]`（省略地址则用 GUI 保存的地址）。
+
 ### 命令行
 
 ```text
 probe-rs-studio.exe --connect --network dap.local
 probe-rs-studio.exe --chip-id --network dap.local
 probe-rs-studio.exe --selftest firmware.hex --network 192.168.1.50:3240
+probe-rs-studio.exe --network-check dap.local
 ```
 
 不加 `--network` 时，headless 命令复用 GUI 保存的配置（包括已启用的网络探针）。
@@ -524,15 +538,25 @@ probe-rs-studio.exe --selftest firmware.hex --network 192.168.1.50:3240
 
 ### 排错与验证状态
 
-连接失败会直接给出「检查设备已上电 / 地址可解析 / TCP 3240 可达 / 未被 OpenOCD 占用」
-的提示，不会像 USB 探针那样反复重试 3 次。
+连接失败会按**失败阶段**给提示（地址解析 / TCP 连接 / 握手 / vendor scope），并指向
+「诊断连接…」，不会像 USB 探针那样反复重试 3 次。真机排查已知的两个坑：
+
+- **代理只接受一个客户端**：本机同时跑 `openocd -f interface/elaphurelink.cfg
+  -c "cmsis-dap elaphurelink addr dap.local"` 时，OpenOCD 会独占唯一的连接，GUI 只能等到
+  `connection timed out`。先退出 OpenOCD 再连。
+- **本机 3240 被 usbipd-win 占用**：usbipd 默认也监听 TCP 3240，把地址填成
+  `127.0.0.1` / `localhost` 会连到它，握手直接被重置。诊断的 `[注意]` 行会点名该进程。
+- **设备 Web 配置页在线 ≠ DAP 服务在线**：无线 DAP 的 `http://<设备IP>/` 配置页能打开，
+  只说明 WiFi 与 HTTP 正常；3240 的 DAP 任务可能因上一次异常断连卡死，需要给设备断电重启。
 
 - 已验证：协议层单测（握手、大端长度、分片重组、迟到响应、坏帧、超长包）与
   **端到端集成测试**（模拟代理 → `CmsisDapFactory::open` → `DAP_Info` 序列 → 成功打开探针），
   6/6 通过；GUI 侧 100 项单测通过，选择器 / 持久化 / CLI 接线均有回归测试。
-- **尚未真机验证**：当前没有 elaphureLink 硬件，实际无线链路延迟、mDNS 解析与设备端
-  `DAP_Info(PacketSize)` 行为需接上真机后再核对。若设备不回答该命令会自动回退到 1496 字节；
-  若 `.local` 无法解析，请改用设备 IP。
+- **真机状态（2026-11-10）**：无线 DAP 已在局域网出现（`dap.local → 192.168.5.5`，
+  Web 配置页 `Wireless DAP - WiFi` 可访问），但关闭占用它的 OpenOCD 后 TCP 3240 仍只在
+  极短窗口开放、且连上也不回握手，判断为设备端 DAP 服务卡死，需断电重启后再验。
+  因此**完整烧录链路仍未在真机上跑通**；协议层 6/6 单测与端到端模拟代理测试已通过。
+  若设备不回答 `DAP_Info(PacketSize)` 会自动回退到 1496 字节；`.local` 解析不了就改用设备 IP。
 
 ## 连接测试一直失败：DAPLink HID 固件死锁
 
@@ -653,9 +677,9 @@ cargo test --release --bin probe-rs-studio
 ## 目录结构
 
 ```
-src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --connect / --network / --ob-open / --id-open 分派
+src/main.rs       入口、窗口配置、--selftest / --watch / --chips / --load / --ports / --loopback / --option-bytes / --chip-id / --connect / --network-check / --network / --ob-open / --id-open 分派
 src/app.rs        会话侧栏（顶部固定烧录按钮 / 固件卸载 / 快捷操作）、16 进制查看器（固件信息卡片左右分栏：左栏详情 + 右栏最近固件紧凑按钮组、右上角纯「✕」）、串口终端（接收区 / 发送区标题行集成控制、定时发送 / 彩色 emoji 快捷输入 / Ctrl+滚轮缩放）、日志剪贴板复制与右键菜单、选项字节与芯片 ID 窗口、主题、配置持久化、热插拔事件、统一的「加载芯片支持」按钮
-src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、内核一致性核对、网络探针选择器解析与直连、探针重新枚举与死锁识别、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
+src/backend.rs    probe-rs 库调用、工作线程、烧录/校验/备份、芯片 ID 只读采集（DPIDR/ROM Table/CPUID/IDCODE/UID）、内核一致性核对、网络探针选择器解析与直连及分阶段诊断（解析/TCP/握手/端口占用）、探针重新枚举与死锁识别、选项字节读取与 OPT.FLM 写入、探针与串口监视、串口会话线程、芯片描述导入
 src/chip_id.rs    芯片 ID 寄存器预设与 CPUID / DPIDR / IDCODE / UID / FlashSize 解码、内核型号与芯片描述一致性判定、报告格式化（纯逻辑，可单测）
 src/option_bytes.rs  选项字节 16 字节镜像、字段编解码、反码维护、变更 diff 与安全校验（纯逻辑，可单测）
 src/pack.rs       CMSIS-Pack 转换器：ZIP / pdsc XML / ELF32 FLM / target YAML（纯 Rust）

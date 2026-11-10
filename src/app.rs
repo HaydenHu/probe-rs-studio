@@ -1466,8 +1466,25 @@ impl App {
                 clear_network = true;
             }
         });
+        let mut check_network = false;
+        ui.horizontal(|ui| {
+            if ui.button("诊断连接…").clicked() {
+                check_network = true;
+            }
+            ui.label(
+                RichText::new("逐段检查解析 / TCP / 握手，结果写入日志台")
+                    .size(9.0)
+                    .color(p.text3),
+            );
+        });
+        if check_network {
+            self.start_job(
+                Job::NetworkCheck(self.cfg.network_probe.clone()),
+                "诊断网络探针",
+            );
+        }
         ui.label(
-            RichText::new("填地址点「应用」即可在上方下拉框选中；清除则只用 USB 探针")
+            RichText::new("点「应用」在上方下拉框选中；「清除」则只用 USB 探针")
                 .size(9.0)
                 .color(p.text3),
         );
@@ -5154,6 +5171,27 @@ mod tests {
         let source = include_str!("app.rs");
         assert!(source.contains("exact_size(272.0)"));
         assert!(source.contains("ui.set_width(320.0)"));
+    }
+
+
+    /// A failed wireless connection must be diagnosable without guessing: the
+    /// sidebar exposes a staged check and the headless CLI mirrors it.
+    #[test]
+    fn network_probe_has_a_staged_diagnostic() {
+        let backend = include_str!("backend.rs");
+        for needle in [
+            "pub fn network_check",
+            "[1/3]",
+            "[2/3]",
+            "[3/3]",
+            "port_owners",
+            "local_listener",
+            "Job::NetworkCheck",
+        ] {
+            assert!(backend.contains(needle), "diagnostic missing {needle}");
+        }
+        assert!(include_str!("app.rs").contains("诊断连接…"));
+        assert!(include_str!("main.rs").contains("--network-check"));
     }
 
 }

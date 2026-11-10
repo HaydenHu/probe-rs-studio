@@ -147,6 +147,17 @@ fn main() -> eframe::Result<()> {
 
     // Headless connection test: exactly the path behind the GUI「连接测试」
     // button, including the probe-open recovery and job-level retries.
+    if let Some(pos) = args.iter().position(|a| a == "--network-check") {
+        let address = args
+            .get(pos + 1)
+            .filter(|v| !v.starts_with("--"))
+            .cloned()
+            .or_else(|| saved_flash_config().map(|cfg| cfg.network_probe))
+            .unwrap_or_else(|| "dap.local".to_owned());
+        print!("{}", backend::network_check(&address));
+        std::process::exit(0);
+    }
+
     if let Some(pos) = args.iter().position(|a| a == "--connect") {
         let mut cfg = saved_flash_config().unwrap_or_default();
         apply_network_cli(&mut cfg, &args);
